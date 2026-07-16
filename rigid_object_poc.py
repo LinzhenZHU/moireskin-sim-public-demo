@@ -1521,6 +1521,9 @@ def simulate_rigid_object_poc(
             np.rint(optical_albedo * 255.0), 0, 255
         ).astype(np.uint8),
         "grating_transmission": post_transmission,
+        "reference_moire_envelope": pre_envelope,
+        "deformed_moire_envelope": post_envelope,
+        "moire_envelope_difference": post_envelope - pre_envelope,
         "moire_envelope": post_envelope,
         "physics": {
             key: physics[key]

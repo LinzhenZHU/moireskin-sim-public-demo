@@ -326,6 +326,111 @@ def build_rigid_observation_figure(state, sensor_radius_mm):
     return figure
 
 
+def build_rigid_moire_figure(state, sensor_radius_mm):
+    axis = state["camera_axis_mm"]
+    mask = state["camera_mask"]
+    envelope_difference = state["moire_envelope_difference"]
+    envelope_limit = max(
+        1e-3,
+        float(np.percentile(np.abs(envelope_difference[mask]), 99)),
+    )
+    raw_difference = state["moire_difference"]
+    raw_limit = max(
+        1.0,
+        float(np.percentile(np.abs(raw_difference[mask]), 99)),
+    )
+    figure = make_subplots(
+        rows=1,
+        cols=4,
+        subplot_titles=(
+            "Reference fringe",
+            "Deformed fringe",
+            "Fringe Δ",
+            "Raw-frame Δ",
+        ),
+        horizontal_spacing=0.035,
+    )
+    panels = (
+        (
+            state["reference_moire_envelope"],
+            "gray",
+            0.5,
+            1.5,
+            "包络",
+        ),
+        (
+            state["deformed_moire_envelope"],
+            "gray",
+            0.5,
+            1.5,
+            "包络",
+        ),
+        (
+            envelope_difference,
+            "RdBu_r",
+            -envelope_limit,
+            envelope_limit,
+            "包络差分",
+        ),
+        (
+            raw_difference,
+            "RdBu_r",
+            -raw_limit,
+            raw_limit,
+            "灰度差分",
+        ),
+    )
+    for column, (image, colorscale, zmin, zmax, label) in enumerate(
+        panels, start=1
+    ):
+        figure.add_trace(
+            go.Heatmap(
+                x=axis,
+                y=axis,
+                z=np.where(mask, image, np.nan),
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                zsmooth=False,
+                showscale=False,
+                hoverongaps=False,
+                hovertemplate=(
+                    f"x %{{x:.2f}} mm<br>y %{{y:.2f}} mm<br>"
+                    f"{label} %{{z:.3f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=column,
+        )
+        anchor = "x" if column == 1 else f"x{column}"
+        figure.update_xaxes(
+            range=[-sensor_radius_mm, sensor_radius_mm],
+            title_text="x (mm)",
+            showgrid=False,
+            constrain="domain",
+            row=1,
+            col=column,
+        )
+        figure.update_yaxes(
+            range=[-sensor_radius_mm, sensor_radius_mm],
+            title_text="y (mm)" if column == 1 else None,
+            showgrid=False,
+            scaleanchor=anchor,
+            scaleratio=1,
+            showticklabels=column == 1,
+            row=1,
+            col=column,
+        )
+    figure.update_layout(
+        height=390,
+        margin={"l": 20, "r": 20, "t": 48, "b": 20},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        uirevision="rigid-object-moire-deformation",
+    )
+    return figure
+
+
 def build_rigid_surface_figure(state):
     axis = state["axis_mm"]
     truth = np.where(
@@ -590,6 +695,18 @@ def render_rigid_poc(config, public_demo=False):
     st.caption(
         "第一排比较真实几何、膜面、Moiré-only 与多频融合；"
         "第二排检查真实外观、共享原始帧、恢复外观与高频几何增量。"
+    )
+    st.subheader("形变下的 Moiré 条纹")
+    st.caption(
+        "Reference 与 Deformed 显示去除物体外观后的低频 Moiré 包络；"
+        "Envelope Δ 显示膜形变造成的条纹弯曲，Raw-frame Δ 则保留光栅遮挡与外观变化。"
+    )
+    st.plotly_chart(
+        build_rigid_moire_figure(
+            state, float(config["sensor_radius_mm"])
+        ),
+        use_container_width=True,
+        config={"displaylogo": False},
     )
     st.plotly_chart(
         build_rigid_observation_figure(state, float(config["sensor_radius_mm"])),
