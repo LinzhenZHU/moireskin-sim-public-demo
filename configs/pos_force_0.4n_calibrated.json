@@ -1,0 +1,57 @@
+{
+  "bottom_layer_motion_scale": 0.5,
+  "boundary_clamp_power": 2.0,
+  "brightness_gain": [
+    0.98,
+    1.06
+  ],
+  "brightness_offset": [
+    -0.01,
+    0.02
+  ],
+  "carrier_contrast": 0.07,
+  "contact_radius_mm": [
+    3.0,
+    4.0
+  ],
+  "contrast": [
+    0.18,
+    0.26
+  ],
+  "grating_angle_a_deg": 18.0,
+  "grating_angle_b_deg": 25.06,
+  "grating_pitch_mm": 0.33,
+  "image_size": 224,
+  "label_to_sensor_matrix": [
+    [
+      0.0,
+      1.0
+    ],
+    [
+      1.0,
+      0.0
+    ]
+  ],
+  "max_contact_center_radius_mm": 12.5,
+  "membrane_stiffness_n_per_mm": 0.35,
+  "moire_phase_offset_rad": -1.2762720155208536,
+  "noise_std": [
+    0.022,
+    0.032
+  ],
+  "normal_force_n": [
+    0.0,
+    0.4
+  ],
+  "outside_intensity": 0.0,
+  "pattern": "parallel",
+  "pressure_kpa": [
+    0.0,
+    0.0
+  ],
+  "pressure_stiffening_per_kpa": 0.15,
+  "pressure_strain_per_kpa": 0.0005,
+  "radial_distortion_k1": 0.12,
+  "sensor_radius_mm": 15.0,
+  "top_layer_motion_scale": 1.0
+}
