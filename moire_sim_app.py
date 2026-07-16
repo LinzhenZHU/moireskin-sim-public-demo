@@ -23,6 +23,7 @@ from rigid_object_poc import OBJECT_TYPES, simulate_rigid_object_poc
 ROOT = Path(__file__).resolve().parent
 BASE_CONFIG = ROOT / "configs" / "simulation_baseline.json"
 RIGID_POC_CONFIG = ROOT / "configs" / "pos_force_0.4n_calibrated.json"
+RIGID_CACHE_SCHEMA_VERSION = 2
 MODE_LABELS = {"point": "点接触平台", "rigid": "刚体接触 3D POC v6"}
 OBJECT_LABELS = {
     "screwdriver": "螺丝刀",
@@ -558,7 +559,9 @@ def build_rigid_ablation_figure(state):
 
 
 @st.cache_data(max_entries=6, show_spinner=False)
-def _simulate_rigid_object_poc_cached(config, parameters):
+def _simulate_rigid_object_poc_cached(
+    config, parameters, cache_schema_version
+):
     return simulate_rigid_object_poc(config, **parameters)
 
 
@@ -665,7 +668,9 @@ def render_rigid_poc(config, public_demo=False):
     if public_demo:
         with st.spinner("正在计算膜接触、光学观测与 3D 重建…"):
             state = _simulate_rigid_object_poc_cached(
-                simulation_config, simulation_parameters
+                simulation_config,
+                simulation_parameters,
+                RIGID_CACHE_SCHEMA_VERSION,
             )
     else:
         state = simulate_rigid_object_poc(
