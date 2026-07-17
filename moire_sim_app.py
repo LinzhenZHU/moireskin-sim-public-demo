@@ -18,13 +18,17 @@ from moire_sim_platform import (
     simulate_dataset,
 )
 from rigid_object_poc import OBJECT_TYPES, simulate_rigid_object_poc
+from rigid_texture_diagnostics import (
+    run_appearance_control_benchmark,
+    run_frequency_response_benchmark,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 BASE_CONFIG = ROOT / "configs" / "simulation_baseline.json"
 RIGID_POC_CONFIG = ROOT / "configs" / "pos_force_0.4n_calibrated.json"
-RIGID_CACHE_SCHEMA_VERSION = 2
-MODE_LABELS = {"point": "点接触平台", "rigid": "刚体接触 3D POC v6"}
+RIGID_CACHE_SCHEMA_VERSION = 3
+MODE_LABELS = {"point": "点接触平台", "rigid": "刚体接触 3D POC v8"}
 OBJECT_LABELS = {
     "screwdriver": "螺丝刀",
     "satin": "缎面纹理刚性试片",
@@ -206,7 +210,7 @@ def build_rigid_observation_figure(state, sensor_radius_mm):
             "GT visual texture",
             "Shared raw frame",
             "Recovered appearance",
-            "Raw-flow high-frequency detail",
+            "Carrier-aware high-frequency detail",
         ),
         horizontal_spacing=0.035,
         vertical_spacing=0.12,
@@ -525,7 +529,7 @@ def build_rigid_ablation_figure(state):
         "Object → membrane texture",
         "Moiré-only geometry",
         "Recovered appearance",
-        "Multiband geometry",
+        "Carrier + appearance geometry",
     )
     values = 100.0 * np.asarray(
         (
@@ -558,6 +562,173 @@ def build_rigid_ablation_figure(state):
     return figure
 
 
+def build_rigid_confidence_figure(state):
+    axis = state["axis_mm"]
+    shift = state["reconstructed_apparent_shift_mm"]
+    shift_magnitude = np.hypot(shift[0], shift[1])
+    figure = make_subplots(
+        rows=1,
+        cols=3,
+        subplot_titles=(
+            "Recovered carrier displacement",
+            "Carrier confidence",
+            "Appearance-geometry confidence",
+        ),
+        horizontal_spacing=0.04,
+    )
+    panels = (
+        (shift_magnitude, "Magma", 0.0, None, "位移 mm"),
+        (state["carrier_confidence"], "Viridis", 0.0, 1.0, "置信度"),
+        (
+            state["appearance_geometry_confidence"],
+            "Viridis",
+            0.0,
+            1.0,
+            "置信度",
+        ),
+    )
+    for column, (image, colorscale, zmin, zmax, label) in enumerate(
+        panels, start=1
+    ):
+        figure.add_trace(
+            go.Heatmap(
+                x=axis,
+                y=axis,
+                z=np.where(state["sensor_mask"], image, np.nan),
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                zsmooth=False,
+                showscale=False,
+                hoverongaps=False,
+                hovertemplate=(
+                    f"x %{{x:.2f}} mm<br>y %{{y:.2f}} mm<br>"
+                    f"{label} %{{z:.3f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=column,
+        )
+        anchor = "x" if column == 1 else f"x{column}"
+        figure.update_xaxes(title_text="x (mm)", row=1, col=column)
+        figure.update_yaxes(
+            title_text="y (mm)" if column == 1 else None,
+            scaleanchor=anchor,
+            scaleratio=1,
+            showticklabels=column == 1,
+            row=1,
+            col=column,
+        )
+    figure.update_layout(
+        height=390,
+        margin={"l": 20, "r": 20, "t": 48, "b": 20},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        uirevision="rigid-object-confidence",
+    )
+    return figure
+
+
+def build_frequency_response_figure(benchmark):
+    rows = benchmark["rows"]
+    frequencies = [row["frequency_cycles_per_mm"] for row in rows]
+    stages = (
+        ("membrane", "Object → membrane", "#8C6D31"),
+        ("oracle_integrated", "Exact-shift oracle", "#6B7280"),
+        ("coarse_inverse", "Moiré-only inverse", "#3B82F6"),
+        ("carrier_fused", "Carrier + appearance", "#0F7B5C"),
+    )
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("Cumulative amplitude transfer", "Texture correlation"),
+        horizontal_spacing=0.10,
+    )
+    for key, label, color in stages:
+        figure.add_trace(
+            go.Scatter(
+                x=frequencies,
+                y=[row[f"{key}_amplitude_gain"] for row in rows],
+                mode="lines+markers",
+                name=label,
+                legendgroup=key,
+                line={"color": color},
+            ),
+            row=1,
+            col=1,
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=frequencies,
+                y=[row[f"{key}_correlation"] for row in rows],
+                mode="lines+markers",
+                name=label,
+                legendgroup=key,
+                showlegend=False,
+                line={"color": color},
+            ),
+            row=1,
+            col=2,
+        )
+    figure.update_xaxes(title_text="Spatial frequency (cycles/mm)")
+    figure.update_yaxes(title_text="Amplitude / object", rangemode="tozero", row=1, col=1)
+    figure.update_yaxes(title_text="Correlation", range=[-0.1, 1.05], row=1, col=2)
+    figure.update_layout(
+        height=410,
+        margin={"l": 20, "r": 20, "t": 48, "b": 20},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend={"orientation": "h", "y": -0.22},
+        uirevision="rigid-frequency-response",
+    )
+    return figure
+
+
+def build_appearance_control_figure(benchmark):
+    names = ("flat_print", "neutral_relief", "coupled_relief")
+    labels = ("Flat + print", "Relief + neutral", "Relief + matched appearance")
+    cases = benchmark["cases"]
+    figure = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=("Recovered high-frequency RMS", "Fusion confidence"),
+        horizontal_spacing=0.12,
+    )
+    figure.add_trace(
+        go.Bar(
+            x=labels,
+            y=[cases[name]["high_frequency_detail_rms_mm"] for name in names],
+            marker_color=("#9AA09C", "#3B82F6", "#0F7B5C"),
+            name="detail RMS",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Bar(
+            x=labels,
+            y=[
+                cases[name]["appearance_geometry_confidence"] for name in names
+            ],
+            marker_color=("#9AA09C", "#3B82F6", "#0F7B5C"),
+            name="confidence",
+        ),
+        row=1,
+        col=2,
+    )
+    figure.update_yaxes(title_text="RMS (mm)", rangemode="tozero", row=1, col=1)
+    figure.update_yaxes(title_text="Mean confidence", range=[0.0, 1.0], row=1, col=2)
+    figure.update_layout(
+        height=380,
+        margin={"l": 20, "r": 20, "t": 48, "b": 40},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        uirevision="rigid-appearance-controls",
+    )
+    return figure
+
+
 @st.cache_data(max_entries=6, show_spinner=False)
 def _simulate_rigid_object_poc_cached(
     config, parameters, cache_schema_version
@@ -565,11 +736,31 @@ def _simulate_rigid_object_poc_cached(
     return simulate_rigid_object_poc(config, **parameters)
 
 
+@st.cache_data(max_entries=4, show_spinner=False)
+def _run_rigid_diagnostics_cached(config, parameters, cache_schema_version):
+    diagnostic_parameters = dict(parameters)
+    diagnostic_parameters.pop("object_type", None)
+    return {
+        "frequency": run_frequency_response_benchmark(
+            config,
+            slope_to_shift_mm=float(parameters["slope_to_shift_mm"]),
+            noise_std=0.0,
+            simulation_parameters=diagnostic_parameters,
+        ),
+        "appearance": run_appearance_control_benchmark(
+            config,
+            slope_to_shift_mm=float(parameters["slope_to_shift_mm"]),
+            noise_std=0.0,
+            simulation_parameters=diagnostic_parameters,
+        ),
+    }
+
+
 def render_rigid_poc(config, public_demo=False):
     with st.sidebar:
-        st.header("刚体接触 3D POC v6")
+        st.header("刚体接触 3D POC v8")
         st.caption(
-            "低频 Moiré 相位与高频原始光栅流联合恢复局部几何；"
+            "低频 Moiré 相位与多尺度载波逆解联合恢复局部几何；"
             "held-out 与 exploratory 形状用于检查跨几何族表现。"
         )
         if public_demo:
@@ -627,6 +818,28 @@ def render_rigid_poc(config, public_demo=False):
                 membrane_tension = st.slider(
                     "膜张力 (N/mm)", 0.03, 0.15, 0.08, 0.01
                 )
+                if public_demo:
+                    membrane_bending_stiffness = 1e-4
+                    cavity_depth = 8.0
+                    sealed_air_coupling = True
+                else:
+                    membrane_bending_stiffness = st.select_slider(
+                        "膜弯曲刚度 D (N·mm)",
+                        options=(0.0, 2.5e-5, 5e-5, 1e-4, 2e-4, 5e-4),
+                        value=1e-4,
+                        format_func=lambda value: f"{value:.1e}",
+                    )
+                    sealed_air_coupling = st.checkbox(
+                        "密闭腔体压力-体积耦合", value=True
+                    )
+                    cavity_depth = st.slider(
+                        "等效腔体深度 (mm)",
+                        3.0,
+                        20.0,
+                        8.0,
+                        0.5,
+                        disabled=not sealed_air_coupling,
+                    )
                 slope_to_shift = st.slider(
                     "斜率-光栅位移标定 (mm)", 0.06, 0.18, 0.12, 0.01
                 )
@@ -657,6 +870,9 @@ def render_rigid_poc(config, public_demo=False):
         "offset_y_mm": offset_y,
         "membrane_tension_n_per_mm": membrane_tension,
         "inflation_pressure_kpa": inflation_pressure,
+        "membrane_bending_stiffness_n_mm": membrane_bending_stiffness,
+        "cavity_depth_mm": cavity_depth,
+        "sealed_air_coupling": sealed_air_coupling,
         "camera_psf_sigma": camera_psf_sigma,
         "camera_supersample": camera_supersample,
         "grating_open_fraction": grating_open_fraction,
@@ -678,10 +894,11 @@ def render_rigid_poc(config, public_demo=False):
         )
     metrics = state["metrics"]
     physics = state["physics"]
-    st.title("Moiré + See-through 刚体接触 3D POC v6")
+    st.title("Moiré + See-through 刚体接触 3D POC v8")
     st.caption(
-        "前向：充气膜接触刚体 → 显式光栅遮挡与 Moiré 调制 → 单一相机原始帧。"
-        "逆向：Moiré 低频形状 + 原始光栅流高频细节 + See-through 外观引导。"
+        "前向：含张力、弯曲刚度与密闭腔体 P-V 耦合的膜接触 → "
+        "显式光栅遮挡与 Moiré 调制 → 单一相机原始帧。"
+        "逆向：Moiré 低频形状 + 多尺度载波相位/LK + 置信度门控的 See-through 外观。"
     )
     summary = st.columns(3)
     summary[0].metric("深度 NRMSE", f"{100 * metrics['height_nrmse']:.1f}%")
@@ -695,7 +912,7 @@ def render_rigid_poc(config, public_demo=False):
     )
     if not state["high_frequency_enabled"]:
         st.warning(
-            "当前相机采样低于每个光栅周期 4 px，高频原始光栅流已自动关闭。"
+            "当前相机采样低于每个光栅周期 4 px，高频载波逆解已自动关闭。"
         )
     st.caption(
         "第一排比较真实几何、膜面、Moiré-only 与多频融合；"
@@ -733,6 +950,16 @@ def render_rigid_poc(config, public_demo=False):
         use_container_width=True,
         config={"displaylogo": False},
     )
+    if not public_demo:
+        st.subheader("逆解置信度")
+        st.caption(
+            "外观只在载波位移可信、且局部外观结构与几何结构一致时参与细节融合。"
+        )
+        st.plotly_chart(
+            build_rigid_confidence_figure(state),
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
     st.caption(
         f"轮廓 IoU {metrics['mask_iou']:.3f} · "
         f"法向误差 {metrics['normal_error_deg']:.1f}° · "
@@ -741,18 +968,67 @@ def render_rigid_poc(config, public_demo=False):
         f"可用开口 {100 * metrics['clear_aperture_fraction']:.1f}% · "
         f"平均透射 {100 * metrics['mean_grating_transmission']:.1f}% · "
         f"采样 {state['camera_pixels_per_grating_pitch']:.2f} px/pitch · "
-        "外观-光流对齐 "
-        f"{state['high_frequency_diagnostics']['appearance_flow_alignment']:.2f} · "
+        "外观-几何对齐 "
+        f"{state['high_frequency_diagnostics']['appearance_geometry_alignment']:.2f} · "
         "外观→几何权重 "
-        f"{state['high_frequency_diagnostics']['appearance_guide_weight']:.2f} · "
+        f"{state['high_frequency_diagnostics']['appearance_geometry_confidence_mean']:.2f} · "
+        "载波置信度 "
+        f"{state['high_frequency_diagnostics']['carrier_confidence_mean']:.2f} · "
         f"纹理 NRMSE {metrics['texture_nrmse']:.2f} · "
         f"端到端纹理 r {metrics['texture_correlation']:.2f} · "
         "物体→膜 "
         f"r {metrics['object_to_membrane_texture_correlation']:.2f} · "
         "膜→重建 "
         f"r {metrics['membrane_to_reconstruction_texture_correlation']:.2f} · "
-        f"接触求解 {physics['iterations']} iterations。"
+        f"接触求解 {physics['iterations']} + {physics['bending_iterations']} iterations · "
+        f"弯曲收敛 {'是' if physics['bending_converged'] else '否'} · "
+        f"有效压差 {physics['effective_pressure_kpa']:.2f} kPa · "
+        f"腔体体积变化 {100 * physics['sealed_air_volume_change_fraction']:.2f}%。"
     )
+    if not public_demo:
+        st.divider()
+        st.subheader("本地研究诊断：频响与外观反事实")
+        st.caption(
+            "Oracle 仅用真值位移计算理论上限，不参与实际重建。"
+            "三组外观对照分别检查平面印刷误报、无纹理浮雕和外观-几何一致浮雕。"
+        )
+        diagnostic_signature = repr((simulation_config, simulation_parameters))
+        if st.button("运行本地诊断", use_container_width=True):
+            with st.spinner("正在运行频率扫描和外观反事实…"):
+                st.session_state["rigid_research_diagnostics"] = (
+                    _run_rigid_diagnostics_cached(
+                        simulation_config,
+                        simulation_parameters,
+                        RIGID_CACHE_SCHEMA_VERSION,
+                    )
+                )
+                st.session_state["rigid_research_diagnostics_signature"] = (
+                    diagnostic_signature
+                )
+        diagnostics = None
+        if (
+            st.session_state.get("rigid_research_diagnostics_signature")
+            == diagnostic_signature
+        ):
+            diagnostics = st.session_state.get("rigid_research_diagnostics")
+        if diagnostics is not None:
+            st.plotly_chart(
+                build_frequency_response_figure(diagnostics["frequency"]),
+                use_container_width=True,
+                config={"displaylogo": False},
+            )
+            st.plotly_chart(
+                build_appearance_control_figure(diagnostics["appearance"]),
+                use_container_width=True,
+                config={"displaylogo": False},
+            )
+            flat = diagnostics["appearance"]["cases"]["flat_print"]
+            coupled = diagnostics["appearance"]["cases"]["coupled_relief"]
+            st.caption(
+                f"平面印刷伪浮雕 RMS {flat['high_frequency_detail_rms_mm']:.4f} mm · "
+                f"平面外观-几何置信度 {flat['appearance_geometry_confidence']:.3f} · "
+                f"一致浮雕纹理 r {coupled['texture_correlation']:.3f}。"
+            )
     st.caption(
         "输出是单次触碰可观测的局部 2.5D 点云；"
         "缎面仍作为带纹理的刚性试片，不模拟织物柔性。"

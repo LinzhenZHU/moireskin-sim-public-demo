@@ -39,6 +39,12 @@ BASE_OBJECT_TYPES = ("screwdriver", "satin", "coin")
 OBJECT_TYPES = (*BASE_OBJECT_TYPES, *TEXTURE_OBJECT_TYPES)
 SHARED_AMBIENT_INTENSITY = 0.06
 MIN_RAW_PIXELS_PER_GRATING_PITCH = 4.0
+DEFAULT_MECHANICAL_MTF_CALIBRATION = {
+    "frequencies_cycles_per_mm": (0.0, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50),
+    "amplitude_gains": (1.0, 0.96, 0.38, 0.18, 0.10, 0.066, 0.045),
+    "wiener_regularization": 0.04,
+    "max_inverse_gain": 2.5,
+}
 
 
 def _object_height_field(
@@ -519,18 +525,66 @@ def _laplacian(field, spacing_mm):
     ) / (spacing_mm * spacing_mm)
 
 
+def _biharmonic(field, spacing_mm):
+    return _laplacian(_laplacian(field, spacing_mm), spacing_mm)
+
+
+def _sealed_cavity_pressure(
+    reference_pressure_kpa,
+    displacement_mm,
+    interior_mask,
+    spacing_mm,
+    cavity_depth_mm,
+):
+    """Return ideal-gas pressure after the membrane displaces cavity volume."""
+    if cavity_depth_mm <= 0.0:
+        raise ValueError("cavity depth must be positive")
+    reference_volume_mm3 = (
+        np.count_nonzero(interior_mask)
+        * spacing_mm
+        * spacing_mm
+        * cavity_depth_mm
+    )
+    displaced_volume_mm3 = float(
+        np.sum(np.maximum(displacement_mm[interior_mask], 0.0))
+        * spacing_mm
+        * spacing_mm
+    )
+    volume_fraction = float(
+        np.clip(
+            displaced_volume_mm3 / max(reference_volume_mm3, 1e-8),
+            0.0,
+            0.35,
+        )
+    )
+    ambient_kpa = 101.325
+    effective_pressure_kpa = (
+        (ambient_kpa + float(reference_pressure_kpa))
+        / (1.0 - volume_fraction)
+        - ambient_kpa
+    )
+    return effective_pressure_kpa, volume_fraction
+
+
 def _solve_membrane_contact(
     obstacle_height_mm,
     sensor_mask,
     spacing_mm,
     membrane_tension_n_per_mm,
     inflation_pressure_kpa,
+    membrane_bending_stiffness_n_mm=0.0,
+    cavity_depth_mm=8.0,
+    sealed_air_coupling=True,
 ):
     """Solve local displacement from an inflated reference toward an obstacle."""
     if membrane_tension_n_per_mm <= 0.0:
         raise ValueError("membrane tension must be positive")
     if inflation_pressure_kpa < 0.0:
         raise ValueError("inflation pressure must be non-negative")
+    if membrane_bending_stiffness_n_mm < 0.0:
+        raise ValueError("membrane bending stiffness must be non-negative")
+    if cavity_depth_mm <= 0.0:
+        raise ValueError("cavity depth must be positive")
     interior = cv2.erode(
         sensor_mask.astype(np.uint8), np.ones((3, 3), np.uint8)
     ).astype(bool)
@@ -543,18 +597,29 @@ def _solve_membrane_contact(
     relaxation = 1.82
     tolerance_mm = 1e-6
     update_mm = math.inf
-    pressure_n_per_mm2 = float(inflation_pressure_kpa) * 1e-3
     # w is measured inward from the inflated reference, so preload lowers the
     # free membrane toward the obstacle in this local coordinate system.
-    pressure_step_mm = (
-        pressure_n_per_mm2
-        * spacing_mm
-        * spacing_mm
-        / (4.0 * membrane_tension_n_per_mm)
-    )
 
     for iteration in range(1, 1201):
         previous = displacement.copy()
+        if sealed_air_coupling:
+            effective_pressure_kpa, volume_fraction = _sealed_cavity_pressure(
+                inflation_pressure_kpa,
+                displacement,
+                interior,
+                spacing_mm,
+                cavity_depth_mm,
+            )
+        else:
+            effective_pressure_kpa = float(inflation_pressure_kpa)
+            volume_fraction = 0.0
+        pressure_n_per_mm2 = effective_pressure_kpa * 1e-3
+        pressure_step_mm = (
+            pressure_n_per_mm2
+            * spacing_mm
+            * spacing_mm
+            / (4.0 * membrane_tension_n_per_mm)
+        )
         for color in (0, 1):
             neighbors = (
                 np.roll(displacement, 1, axis=0)
@@ -577,9 +642,63 @@ def _solve_membrane_contact(
     else:
         raise RuntimeError("membrane contact solver did not converge")
 
+    bending_iterations = 0
+    bending_converged = True
+    if membrane_bending_stiffness_n_mm > 0.0:
+        operator_lipschitz = (
+            8.0 * membrane_tension_n_per_mm / (spacing_mm * spacing_mm)
+            + 64.0
+            * membrane_bending_stiffness_n_mm
+            / (spacing_mm**4)
+        )
+        step = 0.82 / operator_lipschitz
+        for bending_iterations in range(1, 401):
+            previous = displacement.copy()
+            if sealed_air_coupling:
+                effective_pressure_kpa, volume_fraction = (
+                    _sealed_cavity_pressure(
+                        inflation_pressure_kpa,
+                        displacement,
+                        interior,
+                        spacing_mm,
+                        cavity_depth_mm,
+                    )
+                )
+            pressure_n_per_mm2 = effective_pressure_kpa * 1e-3
+            energy_gradient = (
+                -membrane_tension_n_per_mm
+                * _laplacian(displacement, spacing_mm)
+                + membrane_bending_stiffness_n_mm
+                * _biharmonic(displacement, spacing_mm)
+                + pressure_n_per_mm2
+            )
+            candidate = displacement - step * energy_gradient
+            displacement[interior] = np.maximum(
+                obstacle[interior], candidate[interior]
+            )
+            displacement[~interior] = 0.0
+            update_mm = float(np.max(np.abs(displacement - previous)))
+            if update_mm < tolerance_mm:
+                break
+        bending_converged = update_mm < 1e-5
+
+    if sealed_air_coupling:
+        effective_pressure_kpa, volume_fraction = _sealed_cavity_pressure(
+            inflation_pressure_kpa,
+            displacement,
+            interior,
+            spacing_mm,
+            cavity_depth_mm,
+        )
+    else:
+        effective_pressure_kpa = float(inflation_pressure_kpa)
+        volume_fraction = 0.0
+    pressure_n_per_mm2 = effective_pressure_kpa * 1e-3
     pressure = np.maximum(
         -membrane_tension_n_per_mm
         * _laplacian(displacement, spacing_mm)
+        + membrane_bending_stiffness_n_mm
+        * _biharmonic(displacement, spacing_mm)
         + pressure_n_per_mm2,
         0.0,
     )
@@ -596,9 +715,17 @@ def _solve_membrane_contact(
         "contact_mask": contact_mask,
         "boundary_mask": boundary,
         "iterations": iteration,
+        "bending_iterations": bending_iterations,
+        "bending_converged": bending_converged,
         "update_mm": update_mm,
         "normal_force_n": float(np.sum(pressure) * spacing_mm * spacing_mm),
         "inflation_pressure_kpa": float(inflation_pressure_kpa),
+        "effective_pressure_kpa": float(effective_pressure_kpa),
+        "sealed_air_volume_change_fraction": volume_fraction,
+        "membrane_bending_stiffness_n_mm": float(
+            membrane_bending_stiffness_n_mm
+        ),
+        "cavity_depth_mm": float(cavity_depth_mm),
         "contact_fraction": float(
             np.count_nonzero(contact_mask) / max(1, np.count_nonzero(obstacle))
         ),
@@ -869,16 +996,460 @@ def _estimate_object_mask(see_through, xx, yy, sensor_mask):
     ).astype(bool)
 
 
-def _recover_raw_flow_detail(
+def _complex_gaussian_blur(field, sigma_pixels):
+    return cv2.GaussianBlur(
+        field.real.astype(np.float32), (0, 0), sigma_pixels
+    ) + 1j * cv2.GaussianBlur(
+        field.imag.astype(np.float32), (0, 0), sigma_pixels
+    )
+
+
+def _local_carrier_component(image, carrier_x, carrier_y, sigma_pixels):
+    yy, xx = np.indices(image.shape, dtype=np.float32)
+    carrier = np.exp(-1j * (carrier_x * xx + carrier_y * yy))
+    signal = image.astype(np.float32) / 255.0
+    return _complex_gaussian_blur(signal * carrier, sigma_pixels)
+
+
+def _solve_weighted_carrier_displacement(rows, phase_maps, weights):
+    row_x = rows[:, 0, None, None]
+    row_y = rows[:, 1, None, None]
+    normal_xx = np.sum(weights * row_x * row_x, axis=0)
+    normal_xy = np.sum(weights * row_x * row_y, axis=0)
+    normal_yy = np.sum(weights * row_y * row_y, axis=0)
+    right_x = np.sum(weights * row_x * phase_maps, axis=0)
+    right_y = np.sum(weights * row_y * phase_maps, axis=0)
+    determinant = normal_xx * normal_yy - normal_xy * normal_xy
+    valid = determinant > 1e-8
+    displacement_x = np.zeros_like(determinant, dtype=np.float32)
+    displacement_y = np.zeros_like(determinant, dtype=np.float32)
+    displacement_x[valid] = (
+        right_x[valid] * normal_yy[valid]
+        - right_y[valid] * normal_xy[valid]
+    ) / determinant[valid]
+    displacement_y[valid] = (
+        right_y[valid] * normal_xx[valid]
+        - right_x[valid] * normal_xy[valid]
+    ) / determinant[valid]
+    predicted = (
+        row_x * displacement_x[None, ...]
+        + row_y * displacement_y[None, ...]
+    )
+    residual = np.angle(np.exp(1j * (phase_maps - predicted)))
+    residual_rms = np.sqrt(
+        np.sum(weights * residual * residual, axis=0)
+        / np.maximum(np.sum(weights, axis=0), 1e-8)
+    )
+    confidence = (
+        np.mean(weights, axis=0)
+        * np.exp(-0.5 * (residual_rms / 0.45) ** 2)
+        * valid
+    )
+    return displacement_x, displacement_y, confidence, residual_rms
+
+
+def _joint_wrapped_carrier_refinement(
+    rows,
+    phase_maps,
+    weights,
+    initial_x,
+    initial_y,
+    iterations=4,
+):
+    """Refine an LK initialization against every wrapped carrier phase."""
+    displacement_x = np.asarray(initial_x, dtype=np.float32).copy()
+    displacement_y = np.asarray(initial_y, dtype=np.float32).copy()
+    row_x = rows[:, 0, None, None]
+    row_y = rows[:, 1, None, None]
+    weights = np.asarray(weights, dtype=np.float32)
+    for _ in range(int(iterations)):
+        predicted = (
+            row_x * displacement_x[None, ...]
+            + row_y * displacement_y[None, ...]
+        )
+        residual = np.angle(np.exp(1j * (phase_maps - predicted)))
+        robust = weights * np.minimum(
+            1.0, 0.45 / np.maximum(np.abs(residual), 1e-5)
+        )
+        delta_x, delta_y, _, _ = _solve_weighted_carrier_displacement(
+            rows, residual, robust
+        )
+        displacement_x += delta_x
+        displacement_y += delta_y
+
+    predicted = (
+        row_x * displacement_x[None, ...]
+        + row_y * displacement_y[None, ...]
+    )
+    residual = np.angle(np.exp(1j * (phase_maps - predicted)))
+    residual_rms = np.sqrt(
+        np.sum(weights * residual * residual, axis=0)
+        / np.maximum(np.sum(weights, axis=0), 1e-8)
+    )
+    normal_xx = np.sum(weights * row_x * row_x, axis=0)
+    normal_xy = np.sum(weights * row_x * row_y, axis=0)
+    normal_yy = np.sum(weights * row_y * row_y, axis=0)
+    valid = normal_xx * normal_yy - normal_xy * normal_xy > 1e-8
+    confidence = (
+        np.mean(weights, axis=0)
+        * np.exp(-0.5 * (residual_rms / 0.45) ** 2)
+        * valid
+    )
+    return (
+        displacement_x.astype(np.float32),
+        displacement_y.astype(np.float32),
+        np.clip(confidence, 0.0, 1.0).astype(np.float32),
+        residual_rms.astype(np.float32),
+    )
+
+
+def _calibrate_confidence(raw_confidence, calibration, output_key):
+    if not calibration:
+        return np.asarray(raw_confidence, dtype=np.float32)
+    raw_axis = np.asarray(calibration.get("raw_confidence", ()), dtype=np.float32)
+    output_axis = np.asarray(calibration.get(output_key, ()), dtype=np.float32)
+    if (
+        raw_axis.ndim != 1
+        or len(raw_axis) < 2
+        or output_axis.shape != raw_axis.shape
+        or not np.isfinite(raw_axis).all()
+        or not np.isfinite(output_axis).all()
+        or not np.all(np.diff(raw_axis) > 0.0)
+    ):
+        raise ValueError(
+            "confidence calibration axes must be finite increasing vectors"
+        )
+    return np.interp(
+        np.clip(raw_confidence, 0.0, 1.0),
+        raw_axis,
+        output_axis,
+    ).astype(np.float32)
+
+
+def _mechanical_mtf_deconvolution(
+    detail,
+    support,
+    spacing_mm,
+    calibration,
+):
+    calibration = calibration or DEFAULT_MECHANICAL_MTF_CALIBRATION
+    frequencies = np.asarray(
+        calibration["frequencies_cycles_per_mm"], dtype=np.float32
+    )
+    gains = np.asarray(calibration["amplitude_gains"], dtype=np.float32)
+    regularization = float(calibration["wiener_regularization"])
+    max_inverse_gain = float(calibration["max_inverse_gain"])
+    if (
+        frequencies.ndim != 1
+        or len(frequencies) < 2
+        or gains.shape != frequencies.shape
+        or frequencies[0] != 0.0
+        or np.any(np.diff(frequencies) <= 0.0)
+        or np.any(gains <= 0.0)
+        or regularization <= 0.0
+        or max_inverse_gain < 1.0
+    ):
+        raise ValueError("invalid mechanical MTF calibration")
+
+    edge_width = max(1.0, 0.35 / spacing_mm)
+    taper = np.minimum(
+        cv2.distanceTransform(support.astype(np.uint8), cv2.DIST_L2, 3)
+        / edge_width,
+        1.0,
+    )
+    centered = np.asarray(detail, dtype=np.float32).copy()
+    if np.any(support):
+        centered -= float(np.mean(centered[support]))
+    centered *= taper
+    frequency_y = np.fft.fftfreq(centered.shape[0], d=spacing_mm)
+    frequency_x = np.fft.fftfreq(centered.shape[1], d=spacing_mm)
+    radial_frequency = np.hypot(
+        frequency_y[:, None], frequency_x[None, :]
+    )
+    transfer = np.interp(
+        radial_frequency, frequencies, gains, left=gains[0], right=gains[-1]
+    )
+    inverse = (1.0 + regularization) * transfer / (
+        transfer * transfer + regularization
+    )
+    inverse = np.clip(inverse, 1.0, max_inverse_gain)
+    spectrum = np.fft.fft2(centered)
+    corrected = np.fft.ifft2(spectrum * inverse).real.astype(np.float32)
+    corrected *= support
+    if np.any(support):
+        corrected -= float(np.mean(corrected[support])) * support
+    power = np.abs(spectrum) ** 2
+    power_weighted_gain = float(
+        np.sum(power * inverse) / max(float(np.sum(power)), 1e-8)
+    )
+    return corrected, {
+        "mechanical_mtf_regularization": regularization,
+        "mechanical_mtf_max_inverse_gain": max_inverse_gain,
+        "mechanical_mtf_power_weighted_inverse_gain": power_weighted_gain,
+    }
+
+
+def _masked_gaussian(field, support, sigma_pixels):
+    weights = support.astype(np.float32)
+    return cv2.GaussianBlur(
+        field.astype(np.float32) * weights, (0, 0), sigma_pixels
+    ) / np.maximum(cv2.GaussianBlur(weights, (0, 0), sigma_pixels), 1e-5)
+
+
+def _appearance_guided_geometry(
+    geometry_detail,
+    recovered_appearance,
+    appearance_confidence,
+    carrier_confidence,
+    fused_mask,
+    sigma_pixels,
+    confidence_calibration=None,
+):
+    empty = np.zeros_like(geometry_detail, dtype=np.float32)
+    interior = cv2.erode(
+        fused_mask.astype(np.uint8), np.ones((5, 5), np.uint8)
+    ).astype(bool)
+    if np.count_nonzero(interior) < 16:
+        return geometry_detail, empty, empty, 0.0, 0.0
+
+    appearance_local = _masked_gaussian(
+        recovered_appearance, fused_mask, sigma_pixels
+    )
+    geometry_local = _masked_gaussian(
+        geometry_detail, fused_mask, sigma_pixels
+    )
+    appearance_detail = recovered_appearance - appearance_local
+    centered_geometry = geometry_detail - geometry_local
+    covariance = _masked_gaussian(
+        appearance_detail * centered_geometry, fused_mask, sigma_pixels
+    )
+    appearance_variance = _masked_gaussian(
+        appearance_detail * appearance_detail, fused_mask, sigma_pixels
+    )
+    geometry_variance = _masked_gaussian(
+        centered_geometry * centered_geometry, fused_mask, sigma_pixels
+    )
+    correlation = covariance / np.sqrt(
+        np.maximum(appearance_variance * geometry_variance, 1e-12)
+    )
+    appearance_gradient_y, appearance_gradient_x = np.gradient(
+        appearance_detail
+    )
+    geometry_gradient_y, geometry_gradient_x = np.gradient(centered_geometry)
+
+    def orientation_tensor(gradient_x, gradient_y):
+        xx = _masked_gaussian(
+            gradient_x * gradient_x, fused_mask, sigma_pixels
+        )
+        xy = _masked_gaussian(
+            gradient_x * gradient_y, fused_mask, sigma_pixels
+        )
+        yy = _masked_gaussian(
+            gradient_y * gradient_y, fused_mask, sigma_pixels
+        )
+        angle = 0.5 * np.arctan2(2.0 * xy, xx - yy)
+        anisotropy = np.sqrt((xx - yy) ** 2 + 4.0 * xy * xy) / np.maximum(
+            xx + yy, 1e-10
+        )
+        return angle, np.clip(anisotropy, 0.0, 1.0)
+
+    appearance_angle, appearance_anisotropy = orientation_tensor(
+        appearance_gradient_x, appearance_gradient_y
+    )
+    geometry_angle, geometry_anisotropy = orientation_tensor(
+        geometry_gradient_x, geometry_gradient_y
+    )
+    orientation_agreement = (
+        np.abs(np.cos(appearance_angle - geometry_angle))
+        * np.sqrt(appearance_anisotropy * geometry_anisotropy)
+    )
+    geometry_rms = float(
+        np.sqrt(np.mean(centered_geometry[interior] ** 2))
+    )
+    geometry_evidence = np.clip(
+        np.sqrt(np.maximum(geometry_variance, 0.0))
+        / max(0.35 * geometry_rms, 2e-4),
+        0.0,
+        1.0,
+    )
+    global_alignment = 0.0
+    if (
+        np.std(appearance_detail[interior]) > 1e-6
+        and np.std(centered_geometry[interior]) > 1e-6
+    ):
+        global_alignment = float(
+            np.corrcoef(
+                appearance_detail[interior], centered_geometry[interior]
+            )[0, 1]
+        )
+    agreement_evidence = np.maximum(
+        np.abs(correlation), orientation_agreement
+    )
+    agreement = np.clip((agreement_evidence - 0.18) / 0.55, 0.0, 1.0)
+    raw_confidence = (
+        agreement
+        * geometry_evidence
+        * np.clip(appearance_confidence, 0.0, 1.0)
+        * np.clip(carrier_confidence, 0.0, 1.0)
+        * fused_mask
+    )
+    confidence = _calibrate_confidence(
+        raw_confidence,
+        confidence_calibration,
+        "calibrated_probability",
+    ) * (raw_confidence > 1e-6) * fused_mask
+    gain_sign = np.where(
+        np.abs(correlation) > 0.18,
+        np.sign(correlation),
+        1.0 if global_alignment >= 0.0 else -1.0,
+    )
+    local_gain = 4.0 * gain_sign * np.sqrt(
+        np.maximum(geometry_variance, 0.0)
+        / np.maximum(appearance_variance, 1e-6)
+    )
+    gain_limit = max(2.5 * geometry_rms, 1e-3)
+    guided_detail = np.clip(
+        local_gain * appearance_detail, -gain_limit, gain_limit
+    )
+    fused_detail = geometry_detail + confidence * (
+        guided_detail - centered_geometry
+    )
+    return (
+        fused_detail.astype(np.float32),
+        confidence.astype(np.float32),
+        raw_confidence.astype(np.float32),
+        global_alignment,
+        float(np.mean(confidence[interior])),
+    )
+
+
+def _multiscale_carrier_lk(
+    pre_image,
+    post_image,
+    sensor_mask,
+    pixels_per_pitch,
+    spacing_mm,
+):
+    sigma = max(1.0, 1.5 * pixels_per_pitch)
+
+    def carrier_band(image):
+        image_float = image.astype(np.float32)
+        highpass = image_float - cv2.GaussianBlur(
+            image_float, (0, 0), sigma
+        )
+        scale = float(np.percentile(np.abs(highpass[sensor_mask]), 95))
+        return np.clip(128.0 + 96.0 * highpass / max(scale, 1.0), 0, 255).astype(
+            np.uint8
+        )
+
+    pre_carrier = carrier_band(pre_image)
+    post_carrier = carrier_band(post_image)
+    stride = 2
+    grid_x = np.arange(0, pre_image.shape[1], stride, dtype=np.float32)
+    grid_y = np.arange(0, pre_image.shape[0], stride, dtype=np.float32)
+    points_x, points_y = np.meshgrid(grid_x, grid_y)
+    points = np.column_stack((points_x.ravel(), points_y.ravel())).astype(
+        np.float32
+    )[:, None, :]
+    displacement_x = []
+    displacement_y = []
+    confidences = []
+    for multiplier in (2.5, 4.5):
+        window = max(9, int(round(multiplier * pixels_per_pitch)) | 1)
+        next_points, forward_status, eigenvalue = cv2.calcOpticalFlowPyrLK(
+            pre_carrier,
+            post_carrier,
+            points,
+            None,
+            winSize=(window, window),
+            maxLevel=2,
+            criteria=(
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                24,
+                0.01,
+            ),
+            flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
+            minEigThreshold=1e-5,
+        )
+        back_points, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+            post_carrier,
+            pre_carrier,
+            next_points,
+            None,
+            winSize=(window, window),
+            maxLevel=2,
+            criteria=(
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                24,
+                0.01,
+            ),
+        )
+        forward_status = forward_status.ravel().astype(bool)
+        backward_status = backward_status.ravel().astype(bool)
+        valid = forward_status & backward_status
+        forward_backward_error = np.linalg.norm(
+            back_points[:, 0, :] - points[:, 0, :], axis=1
+        )
+        eigenvalue = eigenvalue.ravel()
+        eigen_scale = (
+            float(np.percentile(eigenvalue[valid], 85))
+            if np.any(valid)
+            else 1.0
+        )
+        confidence = (
+            valid
+            * np.clip(eigenvalue / max(eigen_scale, 1e-8), 0.0, 1.0)
+            * np.exp(-0.5 * (forward_backward_error / 0.35) ** 2)
+        )
+        motion = (next_points[:, 0, :] - points[:, 0, :]) * spacing_mm
+        coarse_shape = points_x.shape
+        displacement_x.append(
+            cv2.resize(
+                motion[:, 0].reshape(coarse_shape),
+                pre_image.shape[::-1],
+                interpolation=cv2.INTER_CUBIC,
+            )
+        )
+        displacement_y.append(
+            cv2.resize(
+                motion[:, 1].reshape(coarse_shape),
+                pre_image.shape[::-1],
+                interpolation=cv2.INTER_CUBIC,
+            )
+        )
+        confidences.append(
+            cv2.resize(
+                confidence.astype(np.float32).reshape(coarse_shape),
+                pre_image.shape[::-1],
+                interpolation=cv2.INTER_LINEAR,
+            )
+            * sensor_mask
+        )
+    confidence_stack = np.clip(np.asarray(confidences), 0.0, 1.0)
+    confidence_sum = np.sum(confidence_stack, axis=0)
+    return (
+        np.sum(confidence_stack * np.asarray(displacement_x), axis=0)
+        / np.maximum(confidence_sum, 1e-6),
+        np.sum(confidence_stack * np.asarray(displacement_y), axis=0)
+        / np.maximum(confidence_sum, 1e-6),
+        np.clip(confidence_sum / len(confidences), 0.0, 1.0),
+    )
+
+
+def _recover_carrier_phase_detail(
     config,
     pre_image,
     post_image,
     recovered_appearance,
+    appearance_confidence,
     fused_mask,
     spacing_mm,
     slope_to_shift_mm,
-    raw_flow_to_displacement_scale,
-    raw_flow_highpass_mm,
+    carrier_to_displacement_scale,
+    carrier_highpass_mm,
+    mechanical_mtf_calibration=None,
+    confidence_calibration=None,
+    abstention_threshold=0.20,
 ):
     pixels_per_pitch = (
         (pre_image.shape[0] - 1)
@@ -889,66 +1460,171 @@ def _recover_raw_flow_detail(
     empty = np.zeros_like(recovered_appearance, dtype=np.float32)
     diagnostics = {
         "enabled": enabled,
+        "method": "joint_wrapped_multicarrier_phase_lk_init",
         "pixels_per_grating_pitch": float(pixels_per_pitch),
+        "unique_carrier_count": 0,
+        "joint_observation_count": 0,
+        "carrier_confidence_mean": 0.0,
+        "carrier_phase_residual_rad": 0.0,
+        "appearance_geometry_alignment": 0.0,
+        "appearance_geometry_confidence_mean": 0.0,
+        "raw_appearance_geometry_confidence_mean": 0.0,
+        "reconstruction_confidence_mean": 0.0,
+        "abstention_coverage": 0.0,
         "appearance_flow_alignment": 0.0,
         "appearance_guide_weight": 0.0,
     }
     if not enabled or not np.any(fused_mask):
-        return empty, diagnostics
+        return {
+            "detail_mm": empty,
+            "carrier_only_detail_mm": empty,
+            "appearance_confidence": empty,
+            "raw_appearance_confidence": empty,
+            "diagnostics": diagnostics,
+            "displacement_mm": np.stack((empty, empty)),
+            "carrier_confidence": empty,
+            "reconstruction_confidence": empty,
+            "uncertainty": np.ones_like(empty),
+            "expected_error_mm": np.full_like(empty, 0.12),
+            "abstention_mask": np.zeros_like(fused_mask),
+        }
 
-    flow = cv2.calcOpticalFlowFarneback(
+    pitch = float(config["grating_pitch_mm"])
+    carriers = []
+    rows = []
+    carrier_names = []
+    for direction in _pattern_directions(config["pattern"]):
+        angle_a = math.radians(float(config["grating_angle_a_deg"]) + direction)
+        angle_b = math.radians(float(config["grating_angle_b_deg"]) + direction)
+        top_scale = float(config["top_layer_motion_scale"])
+        bottom_scale = float(config["bottom_layer_motion_scale"])
+        top_carrier = 2.0 * np.pi * spacing_mm * np.asarray(
+            (math.cos(angle_a), math.sin(angle_a)), dtype=np.float32
+        ) / pitch
+        bottom_carrier = 2.0 * np.pi * spacing_mm * np.asarray(
+            (math.cos(angle_b), math.sin(angle_b)), dtype=np.float32
+        ) / pitch
+        top_row = -2.0 * np.pi * top_scale * np.asarray(
+            (math.cos(angle_a), math.sin(angle_a)), dtype=np.float32
+        ) / pitch
+        bottom_row = -2.0 * np.pi * bottom_scale * np.asarray(
+            (math.cos(angle_b), math.sin(angle_b)), dtype=np.float32
+        ) / pitch
+        for name, carrier, row in (
+            ("top", top_carrier, top_row),
+            ("bottom", bottom_carrier, bottom_row),
+            ("sum", top_carrier + bottom_carrier, top_row + bottom_row),
+            (
+                "difference",
+                top_carrier - bottom_carrier,
+                top_row - bottom_row,
+            ),
+        ):
+            carriers.append(tuple(carrier))
+            rows.append(tuple(row))
+            carrier_names.append(f"{direction:g}:{name}")
+    rows = np.asarray(rows, dtype=np.float32)
+    scale_sigmas = pixels_per_pitch * np.asarray((0.65, 1.05, 1.70))
+    scale_priors = (1.0, 0.55, 0.30)
+    phase_observations = []
+    weight_observations = []
+    row_observations = []
+    _, _, sensor_mask = _sensor_grid(config)
+    for sigma_pixels, scale_prior in zip(scale_sigmas, scale_priors):
+        amplitudes = []
+        phases = []
+        for carrier_x, carrier_y in carriers:
+            pre_component = _local_carrier_component(
+                pre_image, carrier_x, carrier_y, float(sigma_pixels)
+            )
+            post_component = _local_carrier_component(
+                post_image, carrier_x, carrier_y, float(sigma_pixels)
+            )
+            phases.append(np.angle(post_component * np.conj(pre_component)))
+            amplitudes.append(
+                np.sqrt(np.abs(pre_component) * np.abs(post_component))
+            )
+        amplitude_scales = np.asarray(
+            [float(np.percentile(value[sensor_mask], 85)) for value in amplitudes]
+        )
+        strength_reference = max(float(np.median(amplitude_scales)), 1e-6)
+        for row, phase, amplitude, amplitude_scale in zip(
+            rows, phases, amplitudes, amplitude_scales
+        ):
+            strength = np.clip(amplitude_scale / strength_reference, 0.5, 1.0)
+            phase_observations.append(phase.astype(np.float32))
+            weight_observations.append(
+                np.clip(amplitude / max(float(amplitude_scale), 1e-6), 0.0, 1.0)
+                * float(scale_prior)
+                * float(strength)
+                * sensor_mask
+            )
+            row_observations.append(row)
+    phase_observations = np.asarray(phase_observations, dtype=np.float32)
+    weight_observations = np.asarray(weight_observations, dtype=np.float32)
+    row_observations = np.asarray(row_observations, dtype=np.float32)
+    lk_x, lk_y, lk_confidence = _multiscale_carrier_lk(
         pre_image,
         post_image,
-        None,
-        0.5,
-        4,
-        5,
-        7,
-        7,
-        1.5,
-        0,
-    )
-    flow_x = flow[..., 0] * spacing_mm
-    flow_y = flow[..., 1] * spacing_mm
-    sigma_pixels = max(1.0, raw_flow_highpass_mm / spacing_mm)
-    high_x = flow_x - cv2.GaussianBlur(flow_x, (0, 0), sigma_pixels)
-    high_y = flow_y - cv2.GaussianBlur(flow_y, (0, 0), sigma_pixels)
-    flow_detail = _integrate_gradient(
-        high_x * raw_flow_to_displacement_scale / slope_to_shift_mm,
-        high_y * raw_flow_to_displacement_scale / slope_to_shift_mm,
+        sensor_mask,
+        pixels_per_pitch,
         spacing_mm,
     )
-    flow_detail -= float(np.mean(flow_detail[fused_mask]))
-
-    support = fused_mask.astype(np.float32)
-    local_form = cv2.GaussianBlur(
-        recovered_appearance * support, (0, 0), sigma_pixels
-    ) / np.maximum(
-        cv2.GaussianBlur(support, (0, 0), sigma_pixels), 1e-4
+    displacement_x, displacement_y, carrier_confidence, residual_rms = (
+        _joint_wrapped_carrier_refinement(
+            row_observations,
+            phase_observations,
+            weight_observations,
+            lk_x,
+            lk_y,
+        )
     )
-    appearance_detail = recovered_appearance - local_form
-    interior = cv2.erode(
-        fused_mask.astype(np.uint8), np.ones((5, 5), np.uint8)
+    background = sensor_mask & ~cv2.dilate(
+        fused_mask.astype(np.uint8), np.ones((7, 7), np.uint8)
     ).astype(bool)
-    if np.count_nonzero(interior) > 8:
-        appearance_values = appearance_detail[interior]
-        flow_values = flow_detail[interior]
-        if np.std(appearance_values) > 1e-6 and np.std(flow_values) > 1e-6:
-            alignment = float(
-                np.corrcoef(appearance_values, flow_values)[0, 1]
-            )
-            appearance_gain = float(
-                np.dot(appearance_values, flow_values)
-                / max(np.dot(appearance_values, appearance_values), 1e-8)
-            )
-            appearance_gain = float(np.clip(appearance_gain, -2.0, 2.0))
-            guide_weight = float(np.clip((alignment - 0.20) / 0.40, 0.0, 0.8))
-            flow_detail = (
-                (1.0 - guide_weight) * flow_detail
-                + guide_weight * appearance_gain * appearance_detail
-            )
-            diagnostics["appearance_flow_alignment"] = alignment
-            diagnostics["appearance_guide_weight"] = guide_weight
+    if np.count_nonzero(background) > 16:
+        displacement_x -= float(np.median(displacement_x[background]))
+        displacement_y -= float(np.median(displacement_y[background]))
+    sigma_pixels = max(1.0, carrier_highpass_mm / spacing_mm)
+    local_x = _masked_gaussian(displacement_x, fused_mask, sigma_pixels)
+    local_y = _masked_gaussian(displacement_y, fused_mask, sigma_pixels)
+    high_x = displacement_x - local_x
+    high_y = displacement_y - local_y
+    geometry_detail = _integrate_gradient(
+        high_x * carrier_to_displacement_scale / slope_to_shift_mm,
+        high_y * carrier_to_displacement_scale / slope_to_shift_mm,
+        spacing_mm,
+    )
+    geometry_detail -= float(np.mean(geometry_detail[fused_mask]))
+    carrier_only_detail, mtf_diagnostics = _mechanical_mtf_deconvolution(
+        geometry_detail,
+        fused_mask,
+        spacing_mm,
+        mechanical_mtf_calibration,
+    )
+    carrier_only_detail = np.clip(carrier_only_detail, -0.20, 0.20)
+    appearance_calibration = (
+        confidence_calibration.get("appearance_helpfulness")
+        if confidence_calibration
+        else None
+    )
+    (
+        fused_detail,
+        appearance_geometry_confidence,
+        raw_appearance_geometry_confidence,
+        alignment,
+        guide_weight,
+    ) = (
+        _appearance_guided_geometry(
+            carrier_only_detail,
+            recovered_appearance,
+            appearance_confidence,
+            carrier_confidence,
+            fused_mask,
+            sigma_pixels,
+            appearance_calibration,
+        )
+    )
 
     edge_width = max(1.0, 0.20 / spacing_mm)
     edge_weight = np.minimum(
@@ -958,7 +1634,82 @@ def _recover_raw_flow_detail(
         / edge_width,
         1.0,
     )
-    return (flow_detail * edge_weight * fused_mask).astype(np.float32), diagnostics
+    raw_reconstruction_confidence = (
+        carrier_confidence
+        * (0.90 + 0.10 * appearance_geometry_confidence)
+        * fused_mask
+    )
+    reconstruction_calibration = (
+        confidence_calibration.get("reconstruction_error")
+        if confidence_calibration
+        else None
+    )
+    reconstruction_confidence = _calibrate_confidence(
+        raw_reconstruction_confidence,
+        reconstruction_calibration,
+        "calibrated_confidence",
+    ) * fused_mask
+    if reconstruction_calibration and "expected_error_mm" in reconstruction_calibration:
+        expected_error_mm = _calibrate_confidence(
+            raw_reconstruction_confidence,
+            reconstruction_calibration,
+            "expected_error_mm",
+        )
+    else:
+        expected_error_mm = 0.12 * (1.0 - reconstruction_confidence)
+    expected_error_mm = expected_error_mm.astype(np.float32)
+    expected_error_mm[~fused_mask] = 0.12
+    abstention_mask = (
+        (reconstruction_confidence >= float(abstention_threshold)) & fused_mask
+    )
+    detail_weight = edge_weight * abstention_mask
+    fused_detail = (fused_detail * detail_weight).astype(np.float32)
+    carrier_only_detail = (
+        carrier_only_detail * detail_weight
+    ).astype(np.float32)
+    diagnostics.update(
+        {
+            "unique_carrier_count": len(carrier_names),
+            "joint_observation_count": len(row_observations),
+            "lk_initialization_confidence_mean": float(
+                np.mean(lk_confidence[fused_mask])
+            ),
+            "carrier_confidence_mean": float(
+                np.mean(carrier_confidence[fused_mask])
+            ),
+            "carrier_phase_residual_rad": float(np.mean(residual_rms[fused_mask])),
+            "appearance_geometry_alignment": alignment,
+            "appearance_geometry_confidence_mean": guide_weight,
+            "raw_appearance_geometry_confidence_mean": float(
+                np.mean(raw_appearance_geometry_confidence[fused_mask])
+            ),
+            "reconstruction_confidence_mean": float(
+                np.mean(reconstruction_confidence[fused_mask])
+            ),
+            "abstention_coverage": float(
+                np.count_nonzero(abstention_mask)
+                / max(1, np.count_nonzero(fused_mask))
+            ),
+            "appearance_flow_alignment": alignment,
+            "appearance_guide_weight": guide_weight,
+            **mtf_diagnostics,
+        }
+    )
+    return {
+        "detail_mm": fused_detail,
+        "carrier_only_detail_mm": carrier_only_detail,
+        "appearance_confidence": appearance_geometry_confidence,
+        "raw_appearance_confidence": raw_appearance_geometry_confidence,
+        "diagnostics": diagnostics,
+        "displacement_mm": np.stack((displacement_x, displacement_y)).astype(
+            np.float32
+        ),
+        "carrier_confidence": carrier_confidence.astype(np.float32),
+        "reconstruction_confidence": reconstruction_confidence.astype(np.float32),
+        "uncertainty": (1.0 - reconstruction_confidence).astype(np.float32),
+        "expected_error_mm": expected_error_mm,
+        "abstention_mask": abstention_mask,
+    }
 
 
 def reconstruct_rigid_contact(
@@ -969,10 +1720,16 @@ def reconstruct_rigid_contact(
     slope_to_shift_mm,
     membrane_tension_n_per_mm,
     inflation_pressure_kpa,
+    membrane_bending_stiffness_n_mm,
+    cavity_depth_mm,
+    sealed_air_coupling,
     grating_open_fraction,
     grating_line_transmittance,
     raw_flow_to_displacement_scale,
     raw_flow_highpass_mm,
+    mechanical_mtf_calibration=None,
+    confidence_calibration=None,
+    abstention_threshold=0.20,
 ):
     """Recover the local interface using observations and calibrated parameters only."""
     if slope_to_shift_mm <= 0.0:
@@ -981,8 +1738,12 @@ def reconstruct_rigid_contact(
         raise ValueError("membrane tension must be positive")
     if inflation_pressure_kpa < 0.0:
         raise ValueError("inflation pressure must be non-negative")
+    if membrane_bending_stiffness_n_mm < 0.0:
+        raise ValueError("membrane bending stiffness must be non-negative")
+    if cavity_depth_mm <= 0.0:
+        raise ValueError("cavity depth must be positive")
     if raw_flow_to_displacement_scale <= 0.0 or raw_flow_highpass_mm <= 0.0:
-        raise ValueError("raw-flow calibration parameters must be positive")
+        raise ValueError("carrier calibration parameters must be positive")
     xx, yy, sensor_mask = _sensor_grid(config)
     expected_shape = xx.shape
     for image in (pre_image, post_image, see_through_image):
@@ -1039,27 +1800,51 @@ def reconstruct_rigid_contact(
     membrane_height *= sensor_mask
     moire_height = membrane_height * moire_mask
     coarse_fused_height = membrane_height * fused_mask
-    high_frequency_detail, high_frequency = _recover_raw_flow_detail(
+    carrier_reconstruction = _recover_carrier_phase_detail(
         config,
         pre_image,
         post_image,
         recovered_appearance,
+        appearance_confidence,
         fused_mask,
         spacing_mm,
         slope_to_shift_mm,
         raw_flow_to_displacement_scale,
         raw_flow_highpass_mm,
+        mechanical_mtf_calibration,
+        confidence_calibration,
+        abstention_threshold,
     )
+    high_frequency_detail = carrier_reconstruction["detail_mm"]
     fused_height = np.clip(
         membrane_height + high_frequency_detail, 0.0, None
     ) * fused_mask
+    carrier_only_height = np.clip(
+        membrane_height + carrier_reconstruction["carrier_only_detail_mm"],
+        0.0,
+        None,
+    ) * fused_mask
     see_through_height = 0.5 * estimated_object_mask
+    if sealed_air_coupling:
+        cavity_interior = cv2.erode(
+            sensor_mask.astype(np.uint8), np.ones((3, 3), np.uint8)
+        ).astype(bool)
+        recovered_pressure_kpa, _ = _sealed_cavity_pressure(
+            inflation_pressure_kpa,
+            membrane_height,
+            cavity_interior,
+            spacing_mm,
+            cavity_depth_mm,
+        )
+    else:
+        recovered_pressure_kpa = float(inflation_pressure_kpa)
+    pressure_surface = cv2.GaussianBlur(membrane_height, (0, 0), 1.5)
     recovered_pressure = np.maximum(
         -membrane_tension_n_per_mm
-        * _laplacian(
-            cv2.GaussianBlur(membrane_height, (0, 0), 1.5), spacing_mm
-        )
-        + float(inflation_pressure_kpa) * 1e-3,
+        * _laplacian(pressure_surface, spacing_mm)
+        + membrane_bending_stiffness_n_mm
+        * _biharmonic(pressure_surface, spacing_mm)
+        + recovered_pressure_kpa * 1e-3,
         0.0,
     ) * fused_mask
     return {
@@ -1069,13 +1854,31 @@ def reconstruct_rigid_contact(
         "reconstructed_membrane_height_mm": membrane_height.astype(np.float32),
         "coarse_fused_height_mm": coarse_fused_height.astype(np.float32),
         "high_frequency_detail_mm": high_frequency_detail.astype(np.float32),
+        "carrier_only_detail_mm": carrier_reconstruction[
+            "carrier_only_detail_mm"
+        ].astype(np.float32),
+        "carrier_only_height_mm": carrier_only_height.astype(np.float32),
         "see_through_only_height_mm": see_through_height.astype(np.float32),
         "moire_only_height_mm": moire_height.astype(np.float32),
         "fused_height_mm": fused_height.astype(np.float32),
         "reconstructed_pressure_n_per_mm2": recovered_pressure.astype(np.float32),
         "recovered_appearance": recovered_appearance,
         "appearance_confidence": appearance_confidence,
-        "high_frequency": high_frequency,
+        "appearance_geometry_confidence": carrier_reconstruction[
+            "appearance_confidence"
+        ],
+        "raw_appearance_geometry_confidence": carrier_reconstruction[
+            "raw_appearance_confidence"
+        ],
+        "carrier_confidence": carrier_reconstruction["carrier_confidence"],
+        "reconstruction_confidence": carrier_reconstruction[
+            "reconstruction_confidence"
+        ],
+        "reconstruction_uncertainty": carrier_reconstruction["uncertainty"],
+        "expected_error_mm": carrier_reconstruction["expected_error_mm"],
+        "abstention_mask": carrier_reconstruction["abstention_mask"],
+        "carrier_displacement_mm": carrier_reconstruction["displacement_mm"],
+        "high_frequency": carrier_reconstruction["diagnostics"],
     }
 
 
@@ -1093,6 +1896,8 @@ def _texture_metrics(target_height, reconstructed_height, support, spacing_mm):
     if not np.any(support):
         return {
             "texture_target_rms_mm": 0.0,
+            "texture_reconstructed_rms_mm": 0.0,
+            "texture_amplitude_gain": 0.0,
             "texture_rmse_mm": math.inf,
             "texture_nrmse": math.inf,
             "texture_correlation": 0.0,
@@ -1114,20 +1919,27 @@ def _texture_metrics(target_height, reconstructed_height, support, spacing_mm):
     target_texture = residual(target_height)[support]
     reconstructed_texture = residual(reconstructed_height)[support]
     target_rms = float(np.sqrt(np.mean(target_texture * target_texture)))
+    reconstructed_rms = float(
+        np.sqrt(np.mean(reconstructed_texture * reconstructed_texture))
+    )
     texture_rmse = float(
         np.sqrt(np.mean((reconstructed_texture - target_texture) ** 2))
     )
     correlation = 0.0
     if (
         len(target_texture) > 1
-        and np.std(target_texture) > 1e-8
-        and np.std(reconstructed_texture) > 1e-8
+        and np.std(target_texture) > 1e-6
+        and np.std(reconstructed_texture) > 1e-6
     ):
         correlation = float(
             np.corrcoef(target_texture, reconstructed_texture)[0, 1]
         )
     return {
         "texture_target_rms_mm": target_rms,
+        "texture_reconstructed_rms_mm": reconstructed_rms,
+        "texture_amplitude_gain": (
+            reconstructed_rms / target_rms if target_rms > 1e-6 else 0.0
+        ),
         "texture_rmse_mm": texture_rmse,
         "texture_nrmse": texture_rmse / max(target_rms, 1e-8),
         "texture_correlation": correlation,
@@ -1158,17 +1970,23 @@ def simulate_rigid_object_poc(
     offset_y_mm=0.0,
     membrane_tension_n_per_mm=0.08,
     inflation_pressure_kpa=4.0,
+    membrane_bending_stiffness_n_mm=1e-4,
+    cavity_depth_mm=8.0,
+    sealed_air_coupling=True,
     camera_psf_sigma=0.45,
     camera_supersample=2,
     grating_open_fraction=0.82,
     grating_line_transmittance=0.10,
     noise_std=0.004,
     slope_to_shift_mm=0.12,
-    raw_flow_to_displacement_scale=1.5,
+    raw_flow_to_displacement_scale=1.0,
     raw_flow_highpass_mm=1.2,
     seed=7,
     height_map_mm=None,
     albedo_map=None,
+    mechanical_mtf_calibration=None,
+    confidence_calibration=None,
+    abstention_threshold=0.20,
 ):
     if texture_frequency <= 0.0 or visual_texture_frequency <= 0.0:
         raise ValueError("texture frequencies must be positive")
@@ -1176,12 +1994,18 @@ def simulate_rigid_object_poc(
         raise ValueError("relief scale and indentation must be positive")
     if inflation_pressure_kpa < 0.0:
         raise ValueError("inflation pressure must be non-negative")
+    if membrane_bending_stiffness_n_mm < 0.0:
+        raise ValueError("membrane bending stiffness must be non-negative")
+    if cavity_depth_mm <= 0.0:
+        raise ValueError("cavity depth must be positive")
     if camera_psf_sigma < 0.0 or noise_std < 0.0:
         raise ValueError("camera PSF and noise must be non-negative")
     if int(camera_supersample) != camera_supersample or camera_supersample < 1:
         raise ValueError("camera supersample must be a positive integer")
     if raw_flow_to_displacement_scale <= 0.0 or raw_flow_highpass_mm <= 0.0:
-        raise ValueError("raw-flow calibration parameters must be positive")
+        raise ValueError("carrier calibration parameters must be positive")
+    if not 0.0 <= float(abstention_threshold) <= 1.0:
+        raise ValueError("abstention threshold must be between zero and one")
     config = dict(config, pattern="cross")
     xx, yy, sensor_mask = _sensor_grid(config)
     spacing_mm = 2.0 * float(config["sensor_radius_mm"]) / (xx.shape[0] - 1)
@@ -1228,6 +2052,9 @@ def simulate_rigid_object_poc(
         spacing_mm,
         float(membrane_tension_n_per_mm),
         float(inflation_pressure_kpa),
+        float(membrane_bending_stiffness_n_mm),
+        float(cavity_depth_mm),
+        bool(sealed_air_coupling),
     )
     membrane_height = physics["membrane_height_mm"]
     gradient_y, gradient_x = np.gradient(membrane_height, spacing_mm)
@@ -1306,10 +2133,16 @@ def simulate_rigid_object_poc(
         float(slope_to_shift_mm),
         float(membrane_tension_n_per_mm),
         float(inflation_pressure_kpa),
+        float(membrane_bending_stiffness_n_mm),
+        float(cavity_depth_mm),
+        bool(sealed_air_coupling),
         float(grating_open_fraction),
         float(grating_line_transmittance),
         float(raw_flow_to_displacement_scale),
         float(raw_flow_highpass_mm),
+        mechanical_mtf_calibration,
+        confidence_calibration,
+        float(abstention_threshold),
     )
 
     physical_size = xx.shape[0]
@@ -1331,6 +2164,15 @@ def simulate_rigid_object_poc(
     high_frequency_detail = resize_field(
         reconstruction["high_frequency_detail_mm"]
     )
+    carrier_only_detail = resize_field(
+        reconstruction["carrier_only_detail_mm"]
+    )
+    carrier_only_height = resize_field(
+        reconstruction["carrier_only_height_mm"]
+    )
+    reconstructed_apparent_shift = np.stack(
+        [resize_field(field) for field in reconstruction["carrier_displacement_mm"]]
+    )
     see_through_height = resize_field(
         reconstruction["see_through_only_height_mm"]
     )
@@ -1342,6 +2184,23 @@ def simulate_rigid_object_poc(
     recovered_appearance_low = resize_field(
         reconstruction["recovered_appearance"]
     )
+    appearance_geometry_confidence_low = resize_field(
+        reconstruction["appearance_geometry_confidence"]
+    )
+    raw_appearance_geometry_confidence_low = resize_field(
+        reconstruction["raw_appearance_geometry_confidence"]
+    )
+    carrier_confidence_low = resize_field(
+        reconstruction["carrier_confidence"]
+    )
+    reconstruction_confidence_low = resize_field(
+        reconstruction["reconstruction_confidence"]
+    )
+    reconstruction_uncertainty_low = resize_field(
+        reconstruction["reconstruction_uncertainty"]
+    )
+    expected_error_low = resize_field(reconstruction["expected_error_mm"])
+    abstention_mask_low = resize_mask(reconstruction["abstention_mask"])
     optical_albedo_low = resize_field(optical_albedo)
     post_transmission_low = resize_field(post_transmission)
     estimated_object_mask = resize_mask(reconstruction["estimated_object_mask"])
@@ -1372,8 +2231,8 @@ def simulate_rigid_object_poc(
     correlation = 0.0
     if (
         len(common_fused) > 1
-        and np.std(common_fused) > 1e-8
-        and np.std(common_target) > 1e-8
+        and np.std(common_fused) > 1e-6
+        and np.std(common_target) > 1e-6
     ):
         correlation = float(np.corrcoef(common_fused, common_target)[0, 1])
     target_normals = _surface_normals(target_height, spacing_mm)
@@ -1410,6 +2269,9 @@ def simulate_rigid_object_poc(
     coarse_texture = _texture_metrics(
         target_height, coarse_fused_height, common, spacing_mm
     )
+    carrier_only_texture = _texture_metrics(
+        target_height, carrier_only_height, common, spacing_mm
+    )
     physics_texture = _texture_metrics(
         target_height, membrane_height, target_mask, spacing_mm
     )
@@ -1432,6 +2294,12 @@ def simulate_rigid_object_poc(
             ],
             "coarse_texture_nrmse": coarse_texture["texture_nrmse"],
             "coarse_texture_correlation": coarse_texture[
+                "texture_correlation"
+            ],
+            "carrier_only_texture_nrmse": carrier_only_texture[
+                "texture_nrmse"
+            ],
+            "carrier_only_texture_correlation": carrier_only_texture[
                 "texture_correlation"
             ],
         }
@@ -1459,7 +2327,7 @@ def simulate_rigid_object_poc(
         )
     )
     return {
-        "model_version": 6,
+        "model_version": 8,
         "object_type": object_type,
         "axis_mm": np.linspace(
             -float(config["sensor_radius_mm"]),
@@ -1491,6 +2359,12 @@ def simulate_rigid_object_poc(
         "reconstructed_membrane_height_mm": reconstructed_membrane_height,
         "coarse_reconstructed_height_mm": coarse_fused_height,
         "high_frequency_detail_mm": high_frequency_detail,
+        "carrier_only_detail_mm": carrier_only_detail,
+        "carrier_only_height_mm": carrier_only_height,
+        "ground_truth_apparent_shift_mm": np.stack(apparent_shift).astype(
+            np.float32
+        ),
+        "reconstructed_apparent_shift_mm": reconstructed_apparent_shift,
         "reconstructed_height_mm": fused_height,
         "reconstructed_pressure_n_per_mm2": reconstructed_pressure,
         "see_through_only_height_mm": see_through_height,
@@ -1517,6 +2391,15 @@ def simulate_rigid_object_poc(
         ).astype(np.uint8),
         "recovered_appearance": recovered_appearance_low,
         "appearance_confidence": reconstruction["appearance_confidence"],
+        "appearance_geometry_confidence": appearance_geometry_confidence_low,
+        "raw_appearance_geometry_confidence": (
+            raw_appearance_geometry_confidence_low
+        ),
+        "carrier_confidence": carrier_confidence_low,
+        "reconstruction_confidence": reconstruction_confidence_low,
+        "reconstruction_uncertainty": reconstruction_uncertainty_low,
+        "expected_error_mm": expected_error_low,
+        "abstention_mask": abstention_mask_low,
         "optical_object_image": np.clip(
             np.rint(optical_albedo * 255.0), 0, 255
         ).astype(np.uint8),
@@ -1529,9 +2412,15 @@ def simulate_rigid_object_poc(
             key: physics[key]
             for key in (
                 "iterations",
+                "bending_iterations",
+                "bending_converged",
                 "update_mm",
                 "normal_force_n",
                 "inflation_pressure_kpa",
+                "effective_pressure_kpa",
+                "sealed_air_volume_change_fraction",
+                "membrane_bending_stiffness_n_mm",
+                "cavity_depth_mm",
                 "contact_fraction",
                 "max_penetration_mm",
                 "boundary_displacement_mm",
