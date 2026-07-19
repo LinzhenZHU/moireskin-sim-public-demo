@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,18 @@ from moire_sim_platform import (
     simulate_contact_state,
     simulate_dataset,
 )
+from public_object_catalog import (
+    PUBLIC_OBJECTS,
+    object_category,
+    public_object_label,
+)
+from public_r1_inference import (
+    PHYSICS_IMAGE_SIZE,
+    compute_demo_metrics,
+    load_model_metadata,
+    run_r1_inference,
+    simulate_pressure_series,
+)
 from rigid_object_poc import OBJECT_TYPES, simulate_rigid_object_poc
 from rigid_texture_diagnostics import (
     run_appearance_control_benchmark,
@@ -28,6 +41,8 @@ ROOT = Path(__file__).resolve().parent
 BASE_CONFIG = ROOT / "configs" / "simulation_baseline.json"
 RIGID_POC_CONFIG = ROOT / "configs" / "pos_force_0.4n_calibrated.json"
 RIGID_CACHE_SCHEMA_VERSION = 3
+PUBLIC_R1_CACHE_SCHEMA_VERSION = 1
+PUBLIC_R1_SIMULATION_LOCK = threading.Lock()
 MODE_LABELS = {"point": "点接触平台", "rigid": "刚体接触 3D POC v8"}
 OBJECT_LABELS = {
     "screwdriver": "螺丝刀",
@@ -629,6 +644,294 @@ def build_rigid_confidence_figure(state):
     return figure
 
 
+def build_public_r1_comparison_figure(state, output):
+    axis = state["axis_mm"]
+    truth = np.where(
+        state["target_mask"],
+        state["ground_truth_height_mm"],
+        np.nan,
+    )
+    physics = np.where(
+        output["physics_mask"],
+        output["base_height_mm"],
+        np.nan,
+    )
+    prediction = np.where(
+        output["predicted_mask"],
+        output["height_mm"],
+        np.nan,
+    )
+    error = np.where(
+        state["target_mask"],
+        np.abs(output["display_height_mm"] - state["ground_truth_height_mm"]),
+        np.nan,
+    )
+    height_limit = max(
+        0.1,
+        float(
+            max(
+                np.nanmax(truth),
+                np.nanmax(physics),
+                np.nanmax(prediction),
+            )
+        ),
+    )
+    error_limit = max(0.01, float(np.nanpercentile(error, 99)))
+    figure = make_subplots(
+        rows=1,
+        cols=4,
+        subplot_titles=(
+            "Synthetic GT",
+            "Pure physics",
+            "Frozen R1",
+            "R1 absolute error",
+        ),
+        horizontal_spacing=0.035,
+    )
+    panels = (
+        (truth, "Viridis", 0.0, height_limit, "高度 mm"),
+        (physics, "Viridis", 0.0, height_limit, "高度 mm"),
+        (prediction, "Viridis", 0.0, height_limit, "高度 mm"),
+        (error, "Magma", 0.0, error_limit, "|误差| mm"),
+    )
+    for column, (image, colorscale, zmin, zmax, label) in enumerate(
+        panels,
+        start=1,
+    ):
+        figure.add_trace(
+            go.Heatmap(
+                x=axis,
+                y=axis,
+                z=image,
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                zsmooth=False,
+                showscale=False,
+                hoverongaps=False,
+                hovertemplate=(
+                    f"x %{{x:.2f}} mm<br>y %{{y:.2f}} mm<br>"
+                    f"{label} %{{z:.3f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=column,
+        )
+        anchor = "x" if column == 1 else f"x{column}"
+        figure.update_xaxes(
+            title_text="x (mm)",
+            constrain="domain",
+            row=1,
+            col=column,
+        )
+        figure.update_yaxes(
+            title_text="y (mm)" if column == 1 else None,
+            scaleanchor=anchor,
+            scaleratio=1,
+            showticklabels=column == 1,
+            row=1,
+            col=column,
+        )
+    figure.update_layout(
+        height=390,
+        margin={"l": 20, "r": 20, "t": 48, "b": 20},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        uirevision="public-r1-comparison",
+    )
+    return figure
+
+
+def build_public_r1_surface_figure(state, output):
+    axis = state["axis_mm"]
+    truth = np.where(
+        state["target_mask"],
+        state["ground_truth_height_mm"],
+        np.nan,
+    )
+    physics = np.where(
+        output["physics_mask"],
+        output["base_height_mm"],
+        np.nan,
+    )
+    prediction = np.where(
+        output["predicted_mask"],
+        output["height_mm"],
+        np.nan,
+    )
+    truth_appearance = np.where(
+        state["target_mask"],
+        state["ground_truth_appearance"],
+        np.nan,
+    )
+    recovered_appearance = np.where(
+        output["predicted_mask"],
+        state["recovered_appearance"],
+        np.nan,
+    )
+    height_limit = max(
+        0.1,
+        float(
+            max(
+                np.nanmax(truth),
+                np.nanmax(physics),
+                np.nanmax(prediction),
+            )
+        ),
+    )
+    figure = make_subplots(
+        rows=1,
+        cols=4,
+        specs=[[
+            {"type": "surface"},
+            {"type": "surface"},
+            {"type": "surface"},
+            {"type": "surface"},
+        ]],
+        subplot_titles=(
+            "GT + appearance",
+            "Pure physics",
+            "R1 geometry",
+            "R1 + recovered appearance",
+        ),
+        horizontal_spacing=0.025,
+    )
+    panels = (
+        (truth, truth_appearance, "gray", 0.0, 1.0),
+        (physics, physics, "Viridis", 0.0, height_limit),
+        (prediction, prediction, "Viridis", 0.0, height_limit),
+        (prediction, recovered_appearance, "gray", 0.0, 1.0),
+    )
+    for column, (height, surface_color, colorscale, cmin, cmax) in enumerate(
+        panels,
+        start=1,
+    ):
+        figure.add_trace(
+            go.Surface(
+                x=axis,
+                y=axis,
+                z=height,
+                surfacecolor=surface_color,
+                colorscale=colorscale,
+                cmin=cmin,
+                cmax=cmax,
+                showscale=False,
+                customdata=surface_color,
+                hovertemplate=(
+                    "x %{x:.2f} mm<br>y %{y:.2f} mm<br>"
+                    "z %{z:.3f} mm<br>surface %{customdata:.3f}"
+                    "<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=column,
+        )
+    scene = {
+        "xaxis_title": "x (mm)",
+        "yaxis_title": "y (mm)",
+        "zaxis_title": "height (mm)",
+        "zaxis_range": [0.0, height_limit],
+        "aspectmode": "manual",
+        "aspectratio": {"x": 1.0, "y": 1.0, "z": 0.35},
+        "camera": {"eye": {"x": 1.35, "y": -1.35, "z": 0.9}},
+    }
+    figure.update_layout(
+        height=500,
+        scene=scene,
+        scene2=scene,
+        scene3=scene,
+        scene4=scene,
+        margin={"l": 0, "r": 0, "t": 48, "b": 0},
+        paper_bgcolor="rgba(0,0,0,0)",
+        uirevision="public-r1-surfaces",
+    )
+    return figure
+
+
+def build_public_r1_evidence_figure(state, output):
+    axis = state["axis_mm"]
+    uncertainty_limit = max(
+        0.01,
+        float(
+            np.percentile(
+                output["uncertainty_mm"][state["sensor_mask"]],
+                99,
+            )
+        ),
+    )
+    figure = make_subplots(
+        rows=1,
+        cols=5,
+        subplot_titles=(
+            "Contact probability",
+            "Uncertainty",
+            "Physics gate",
+            "Appearance gate",
+            "Safety gate",
+        ),
+        horizontal_spacing=0.03,
+    )
+    panels = (
+        (output["mask_probability"], "Viridis", 0.0, 1.0, "概率"),
+        (
+            output["uncertainty_mm"],
+            "Magma",
+            0.0,
+            uncertainty_limit,
+            "σ mm",
+        ),
+        (output["physics_gate"], "Viridis", 0.0, 1.0, "gate"),
+        (output["appearance_gate"], "Viridis", 0.0, 1.0, "gate"),
+        (output["safety_gate"], "Viridis", 0.0, 2.0, "gate"),
+    )
+    for column, (image, colorscale, zmin, zmax, label) in enumerate(
+        panels,
+        start=1,
+    ):
+        figure.add_trace(
+            go.Heatmap(
+                x=axis,
+                y=axis,
+                z=np.where(state["sensor_mask"], image, np.nan),
+                colorscale=colorscale,
+                zmin=zmin,
+                zmax=zmax,
+                zsmooth=False,
+                showscale=False,
+                hoverongaps=False,
+                hovertemplate=(
+                    f"x %{{x:.2f}} mm<br>y %{{y:.2f}} mm<br>"
+                    f"{label} %{{z:.3f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=column,
+        )
+        anchor = "x" if column == 1 else f"x{column}"
+        figure.update_xaxes(
+            title_text="x (mm)",
+            constrain="domain",
+            row=1,
+            col=column,
+        )
+        figure.update_yaxes(
+            title_text="y (mm)" if column == 1 else None,
+            scaleanchor=anchor,
+            scaleratio=1,
+            showticklabels=column == 1,
+            row=1,
+            col=column,
+        )
+    figure.update_layout(
+        height=350,
+        margin={"l": 20, "r": 20, "t": 48, "b": 20},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        uirevision="public-r1-evidence",
+    )
+    return figure
+
+
 def build_frequency_response_figure(benchmark):
     rows = benchmark["rows"]
     frequencies = [row["frequency_cycles_per_mm"] for row in rows]
@@ -736,6 +1039,38 @@ def _simulate_rigid_object_poc_cached(
     return simulate_rigid_object_poc(config, **parameters)
 
 
+@st.cache_resource(max_entries=1, show_spinner=False)
+def _simulate_public_pressure_series_cached(
+    config,
+    parameters,
+    cache_schema_version,
+):
+    with PUBLIC_R1_SIMULATION_LOCK:
+        states = simulate_pressure_series(
+            base_config=config,
+            **parameters,
+        )
+    model_fields = (
+        "pre_image",
+        "post_image",
+        "recovered_appearance",
+        "carrier_only_height_mm",
+        "reconstructed_height_mm",
+        "reconstruction_confidence",
+        "appearance_geometry_confidence",
+        "carrier_confidence",
+        "expected_error_mm",
+        "estimated_mask",
+    )
+    anchor_index = len(states) // 2
+    return [
+        state
+        if index == anchor_index
+        else {name: state[name] for name in model_fields}
+        for index, state in enumerate(states)
+    ]
+
+
 @st.cache_data(max_entries=4, show_spinner=False)
 def _run_rigid_diagnostics_cached(config, parameters, cache_schema_version):
     diagnostic_parameters = dict(parameters)
@@ -754,6 +1089,353 @@ def _run_rigid_diagnostics_cached(config, parameters, cache_schema_version):
             simulation_parameters=diagnostic_parameters,
         ),
     }
+
+
+def render_public_r1_demo(config):
+    metadata = load_model_metadata()
+    with st.sidebar:
+        st.header("MoiréSkin · Frozen R1")
+        st.caption(
+            "五压力膜接触 + Moiré/see-through 多模态重建。"
+            "固定 192² 物理网格与 2× 相机采样，CPU ONNX 推理。"
+        )
+        with st.form("public-r1-controls"):
+            object_name = st.selectbox(
+                "接触物体",
+                PUBLIC_OBJECTS,
+                index=PUBLIC_OBJECTS.index("coin_relief"),
+                format_func=public_object_label,
+            )
+            pattern = st.selectbox(
+                "光栅 pattern",
+                tuple(PATTERN_LABELS),
+                index=tuple(PATTERN_LABELS).index("cross"),
+                format_func=PATTERN_LABELS.get,
+            )
+            pressure_frame_count = st.select_slider(
+                "用于重建的压力帧数",
+                options=(1, 2, 3, 5),
+                value=5,
+            )
+            indentation = st.slider(
+                "压入深度 (mm)",
+                0.52,
+                1.18,
+                0.85,
+                0.03,
+            )
+            rotation = st.slider(
+                "平面旋转 (deg)",
+                -90.0,
+                90.0,
+                20.0,
+                5.0,
+            )
+            offset_x = st.slider(
+                "物体位置 x (mm)",
+                -2.0,
+                2.0,
+                0.0,
+                0.25,
+            )
+            offset_y = st.slider(
+                "物体位置 y (mm)",
+                -2.0,
+                2.0,
+                0.0,
+                0.25,
+            )
+            with st.expander("表面与成像", expanded=True):
+                texture_frequency = st.slider(
+                    "几何纹理频率 (cycles/mm)",
+                    0.20,
+                    2.60,
+                    1.20,
+                    0.05,
+                )
+                visual_texture_frequency = st.slider(
+                    "视觉纹理频率 (cycles/mm)",
+                    0.20,
+                    2.60,
+                    0.70,
+                    0.05,
+                )
+                relief_scale = st.slider(
+                    "表面起伏尺度",
+                    0.72,
+                    1.28,
+                    1.00,
+                    0.04,
+                )
+                camera_psf_sigma = st.slider(
+                    "相机 PSF σ (px)",
+                    0.20,
+                    0.72,
+                    0.45,
+                    0.01,
+                )
+                grating_open_fraction = st.slider(
+                    "单方向光栅开口率",
+                    0.73,
+                    0.90,
+                    0.82,
+                    0.01,
+                )
+                grating_line_transmittance = st.slider(
+                    "光栅线透射率",
+                    0.05,
+                    0.16,
+                    0.10,
+                    0.01,
+                )
+                noise_std = st.slider(
+                    "读出噪声 σ",
+                    0.0015,
+                    0.0120,
+                    0.0040,
+                    0.0005,
+                    format="%.4f",
+                )
+            with st.expander("膜与复现"):
+                base_tension = st.slider(
+                    "0 kPa 膜张力 (N/mm)",
+                    0.064,
+                    0.096,
+                    0.080,
+                    0.002,
+                    format="%.3f",
+                )
+                seed = int(
+                    st.number_input(
+                        "随机种子",
+                        min_value=0,
+                        value=7,
+                        step=1,
+                    )
+                )
+            st.form_submit_button(
+                "运行五压力模拟 + R1",
+                type="primary",
+                use_container_width=True,
+            )
+        st.caption(
+            "公开 Demo 不生成训练集、不训练模型、不接受文件路径，"
+            "且不包含 sealed-test 样本。"
+        )
+
+    parameters = {
+        "object_name": object_name,
+        "pattern": pattern,
+        "rotation_deg": rotation,
+        "texture_frequency": texture_frequency,
+        "visual_texture_frequency": visual_texture_frequency,
+        "relief_scale": relief_scale,
+        "indentation_mm": indentation,
+        "offset_x_mm": offset_x,
+        "offset_y_mm": offset_y,
+        "base_tension_n_per_mm": base_tension,
+        "camera_psf_sigma": camera_psf_sigma,
+        "grating_open_fraction": grating_open_fraction,
+        "grating_line_transmittance": grating_line_transmittance,
+        "noise_std": noise_std,
+        "seed": seed,
+    }
+    geometry_key = repr(
+        (
+            object_name,
+            rotation,
+            texture_frequency,
+            relief_scale,
+            indentation,
+            offset_x,
+            offset_y,
+            seed,
+        )
+    )
+    with st.spinner(
+        "正在生成 0/2/4/6/8 kPa 观测并运行冻结 R1…"
+    ):
+        states = _simulate_public_pressure_series_cached(
+            config,
+            parameters,
+            PUBLIC_R1_CACHE_SCHEMA_VERSION,
+        )
+        output = run_r1_inference(
+            states,
+            pressure_frame_count,
+            geometry_key,
+        )
+
+    anchor = states[2]
+    metrics = output["metrics"]
+    physics_metrics = output["physics_metrics"]
+    poc_metrics = compute_demo_metrics(
+        anchor,
+        anchor["reconstructed_height_mm"],
+        anchor["estimated_mask"],
+    )
+    iou_delta = metrics["mask_iou"] - physics_metrics["mask_iou"]
+    height_delta_pp = 100.0 * (
+        metrics["height_nrmse"] - physics_metrics["height_nrmse"]
+    )
+    texture_delta = (
+        metrics["texture_correlation"]
+        - physics_metrics["texture_correlation"]
+    )
+    normal_delta = (
+        metrics["normal_error_deg"]
+        - physics_metrics["normal_error_deg"]
+    )
+    category = object_category(object_name)
+    category_labels = {
+        "trained named family": "具名训练族",
+        "held-out named family": "具名 held-out 族",
+        "exploratory named family": "具名探索族",
+        "procedural OOD": "程序化 OOD",
+    }
+
+    st.title("Moiré + See-through · Frozen R1 Reconstruction")
+    st.caption(
+        f"{public_object_label(object_name)} · "
+        f"{PATTERN_LABELS[pattern]} · "
+        f"{pressure_frame_count} pressure frame(s) · "
+        f"{category_labels[category]}"
+    )
+    if category == "procedural OOD":
+        st.info(
+            "这是训练集中不存在的确定性随机表面，用于压力测试泛化；"
+            "当前数值是该合成样本的在线诊断，不是 sealed-test 结果。"
+        )
+
+    summary = st.columns(4)
+    summary[0].metric(
+        "R1 高度 NRMSE",
+        f"{100.0 * metrics['height_nrmse']:.1f}%",
+        f"{height_delta_pp:+.1f} pp vs physics",
+        delta_color="inverse",
+    )
+    summary[1].metric(
+        "R1 纹理相关 r",
+        f"{metrics['texture_correlation']:.3f}",
+        f"{texture_delta:+.3f} vs physics",
+    )
+    summary[2].metric(
+        "R1 轮廓 IoU",
+        f"{metrics['mask_iou']:.3f}",
+        (
+            "≈0.000 vs physics"
+            if abs(iou_delta) < 0.0005
+            else f"{iou_delta:+.3f} vs physics"
+        ),
+        delta_color="off" if abs(iou_delta) < 0.0005 else "normal",
+    )
+    summary[3].metric(
+        "R1 法向误差",
+        f"{metrics['normal_error_deg']:.1f}°",
+        f"{normal_delta:+.1f}° vs physics",
+        delta_color="inverse",
+    )
+    st.caption(
+        f"预测不确定度 p95 {metrics['uncertainty_p95_mm']:.3f} mm · "
+        "高度 NRMSE 与纹理相关均按冻结 evaluator 的 GT 接触支撑口径计算；"
+        "线上合成 GT 仅用于交互诊断。"
+    )
+
+    st.subheader("同一合成接触上的公平对比")
+    st.plotly_chart(
+        build_public_r1_comparison_figure(anchor, output),
+        use_container_width=True,
+        config={"displaylogo": False},
+    )
+    st.markdown(
+        "| 系统 | 高度 NRMSE ↓ | 纹理 r ↑ | IoU ↑ | 法向误差 ↓ |\n"
+        "|---|---:|---:|---:|---:|\n"
+        f"| Pure physics | {100 * physics_metrics['height_nrmse']:.1f}% | "
+        f"{physics_metrics['texture_correlation']:.3f} | "
+        f"{physics_metrics['mask_iou']:.3f} | "
+        f"{physics_metrics['normal_error_deg']:.1f}° |\n"
+        f"| Analytic POC v8 @ 4 kPa | {100 * poc_metrics['height_nrmse']:.1f}% | "
+        f"{poc_metrics['texture_correlation']:.3f} | "
+        f"{poc_metrics['mask_iou']:.3f} | "
+        f"{poc_metrics['normal_error_deg']:.1f}° |\n"
+        f"| **Frozen R1** | **{100 * metrics['height_nrmse']:.1f}%** | "
+        f"**{metrics['texture_correlation']:.3f}** | "
+        f"**{metrics['mask_iou']:.3f}** | "
+        f"**{metrics['normal_error_deg']:.1f}°** |"
+    )
+
+    st.subheader("渐进气压观测")
+    selected_columns = st.columns(
+        len(output["selected_pressure_indices"])
+    )
+    for column, pressure_index, pressure_kpa in zip(
+        selected_columns,
+        output["selected_pressure_indices"],
+        output["selected_pressures_kpa"],
+    ):
+        column.image(
+            np.flipud(states[pressure_index]["post_image"]),
+            caption=f"{pressure_kpa:.0f} kPa",
+            use_column_width=True,
+            clamp=True,
+        )
+    st.caption(
+        "显示层已统一 y 轴方向；模型仍接收原始仿真数组。"
+        "1/2/3 帧模式只改变 pressure-validity，不重新选择或调节模型。"
+    )
+
+    st.subheader("4 kPa 锚点的形变 Moiré")
+    st.plotly_chart(
+        build_rigid_moire_figure(
+            anchor,
+            float(config["sensor_radius_mm"]),
+        ),
+        use_container_width=True,
+        config={"displaylogo": False},
+    )
+    with st.expander("查看 Moiré / see-through / appearance 全链路"):
+        st.plotly_chart(
+            build_rigid_observation_figure(
+                anchor,
+                float(config["sensor_radius_mm"]),
+            ),
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+
+    st.subheader("局部 2.5D 表面与外观")
+    st.plotly_chart(
+        build_public_r1_surface_figure(anchor, output),
+        use_container_width=True,
+        config={"displaylogo": False, "scrollZoom": True},
+    )
+    st.caption(
+        "Recovered appearance 只作为 R1 表面的颜色贴图；"
+        "图案不会被无条件写成高度。几何由多压力 raw image、"
+        "纯物理初值和 confidence-gated residual 共同决定。"
+    )
+
+    st.subheader("Fusion 与不确定性")
+    st.plotly_chart(
+        build_public_r1_evidence_figure(anchor, output),
+        use_container_width=True,
+        config={"displaylogo": False},
+    )
+    st.caption(
+        "Physics / appearance / safety gate 是冻结模型的真实输出，"
+        "用于观察物理低频、外观高频和安全回退在空间上的分工。"
+    )
+
+    source = metadata["source"]
+    st.divider()
+    st.caption(
+        f"Frozen {source['candidate_id']} · "
+        f"{source['model_variant']} · width {source['width']} · "
+        f"ONNX {metadata['artifact_sha256'][:12]}… · "
+        f"{PHYSICS_IMAGE_SIZE}² physics / 2× camera · "
+        "sealed test was not exported into or read by this online app · "
+        "synthetic local 2.5D proof of concept, not a real-sensor accuracy claim."
+    )
 
 
 def render_rigid_poc(config, public_demo=False):

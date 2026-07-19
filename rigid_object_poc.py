@@ -491,10 +491,10 @@ def _recover_displacement(config, pre_image, post_image, sensor_mask):
         )
         phase_maps.append(np.angle(post_component * np.conj(pre_component)))
         rows.append(row)
-    if len(rows) != 2:
-        raise ValueError("rigid reconstruction needs a cross pattern with two carriers")
+    if not rows:
+        raise ValueError("rigid reconstruction needs at least one carrier")
     recovered = np.einsum(
-        "ij,jhw->ihw", np.linalg.inv(np.asarray(rows)), np.asarray(phase_maps)
+        "ij,jhw->ihw", np.linalg.pinv(np.asarray(rows)), np.asarray(phase_maps)
     )
     recovered[:, ~sensor_mask] = 0.0
     return recovered
@@ -1961,6 +1961,7 @@ def _chamfer_distance_mm(first, second):
 def simulate_rigid_object_poc(
     config,
     object_type="screwdriver",
+    pattern=None,
     rotation_deg=20.0,
     texture_frequency=1.2,
     visual_texture_frequency=0.7,
@@ -2006,7 +2007,8 @@ def simulate_rigid_object_poc(
         raise ValueError("carrier calibration parameters must be positive")
     if not 0.0 <= float(abstention_threshold) <= 1.0:
         raise ValueError("abstention threshold must be between zero and one")
-    config = dict(config, pattern="cross")
+    config = dict(config, pattern="cross" if pattern is None else pattern)
+    _pattern_directions(config["pattern"])
     xx, yy, sensor_mask = _sensor_grid(config)
     spacing_mm = 2.0 * float(config["sensor_radius_mm"]) / (xx.shape[0] - 1)
 

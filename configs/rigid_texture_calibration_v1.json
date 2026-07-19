@@ -1,0 +1,173 @@
+{
+  "bundle_type": "moireskin_rigid_texture_calibration",
+  "calibration_confidence": {
+    "camera": 1.0,
+    "grating": 1.0,
+    "inverse": 0.75,
+    "membrane": 0.75
+  },
+  "calibration_id": "synthetic-v8-13c565fb7e8c8997",
+  "camera": {
+    "brightness_gain": [0.98, 1.06],
+    "brightness_offset": [-0.01, 0.02],
+    "exposure_scale": 1.0,
+    "physics_image_size_px": 192,
+    "physics_pixels_per_mm": 6.366666666666666,
+    "psf_sigma_px": 0.45,
+    "radial_distortion_k1": 0.12,
+    "raw_pixels_per_mm": 12.766666666666667,
+    "raw_supersample": 2,
+    "read_noise_std": 0.004,
+    "response_gamma": 1.0
+  },
+  "compatible_model_version": 8,
+  "coordinates": {
+    "array_row_zero": "y=-sensor_radius_mm",
+    "display_transform": "flipud_once",
+    "origin": "sensor_center",
+    "x_axis": "positive_image_column_right",
+    "y_axis": "positive_physical_up",
+    "z_axis": "positive_toward_contact_object"
+  },
+  "grating": {
+    "angle_a_deg": 18.0,
+    "angle_b_deg": 25.06,
+    "bottom_layer_motion_scale": 0.5,
+    "directions_deg": [0.0, 90.0],
+    "line_transmittance": 0.1,
+    "open_fraction": 0.82,
+    "pattern": "cross",
+    "pitch_mm": 0.33,
+    "top_layer_motion_scale": 1.0
+  },
+  "inverse": {
+    "abstention_threshold": 0.2,
+    "carrier_highpass_mm": 1.2,
+    "carrier_to_displacement_scale": 1.0,
+    "confidence_calibration": {
+      "appearance_helpfulness": {
+        "bin_counts": [56358, 14979, 6955, 1235, 0, 0, 0, 0],
+        "calibrated_probability": [
+          0.16459065261364847,
+          0.16459065261364847,
+          0.5268041925362174,
+          0.5433501078360892,
+          0.5862348178137652,
+          0.5862348178137652,
+          0.5862348178137652,
+          0.5862348178137652,
+          0.5862348178137652,
+          0.5862348178137652
+        ],
+        "raw_confidence": [
+          0.0,
+          0.0625,
+          0.1875,
+          0.3125,
+          0.4375,
+          0.5625,
+          0.6875,
+          0.8125,
+          0.9375,
+          1.0
+        ]
+      },
+      "reconstruction_error": {
+        "bin_counts": [309, 11976, 34979, 31809, 454, 0, 0, 0],
+        "calibrated_confidence": [
+          0.5644546026423538,
+          0.5644546026423538,
+          0.6515767900709042,
+          0.7189860830082369,
+          0.733737761943214,
+          0.733737761943214,
+          0.733737761943214,
+          0.733737761943214,
+          0.733737761943214,
+          0.733737761943214
+        ],
+        "error_scale_mm": 0.09037181288003922,
+        "expected_error_mm": [
+          0.03936102715076752,
+          0.03936102715076752,
+          0.03148763713077486,
+          0.025395737123066486,
+          0.024062601154688317,
+          0.024062601154688317,
+          0.024062601154688317,
+          0.024062601154688317,
+          0.024062601154688317,
+          0.024062601154688317
+        ],
+        "raw_confidence": [
+          0.0,
+          0.0625,
+          0.1875,
+          0.3125,
+          0.4375,
+          0.5625,
+          0.6875,
+          0.8125,
+          0.9375,
+          1.0
+        ]
+      }
+    },
+    "slope_to_shift_mm": 0.12
+  },
+  "membrane": {
+    "bending_stiffness_n_mm": 0.0001,
+    "cavity_depth_mm": 8.0,
+    "mechanical_mtf": {
+      "amplitude_gains": [1.0, 0.96, 0.38, 0.18, 0.1, 0.066, 0.045],
+      "frequencies_cycles_per_mm": [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
+      "max_inverse_gain": 2.5,
+      "wiener_regularization": 0.04
+    },
+    "pressure_volume_curve": {
+      "ambient_pressure_kpa": 101.325,
+      "maximum_volume_change_fraction": 0.35,
+      "model": "isothermal_ideal_gas"
+    },
+    "reference_inflation_pressure_kpa": 4.0,
+    "sealed_air_coupling": true,
+    "tension_n_per_mm": 0.08
+  },
+  "parameter_snapshot": {
+    "bottom_layer_motion_scale": 0.5,
+    "boundary_clamp_power": 2.0,
+    "brightness_gain": [0.98, 1.06],
+    "brightness_offset": [-0.01, 0.02],
+    "carrier_contrast": 0.07,
+    "contact_radius_mm": [3.0, 4.0],
+    "contrast": [0.18, 0.26],
+    "grating_angle_a_deg": 18.0,
+    "grating_angle_b_deg": 25.06,
+    "grating_pitch_mm": 0.33,
+    "image_size": 192,
+    "label_to_sensor_matrix": [[0.0, 1.0], [1.0, 0.0]],
+    "max_contact_center_radius_mm": 12.5,
+    "membrane_stiffness_n_per_mm": 0.35,
+    "moire_phase_offset_rad": -1.2762720155208536,
+    "noise_std": [0.022, 0.032],
+    "normal_force_n": [0.0, 0.4],
+    "outside_intensity": 0.0,
+    "pattern": "cross",
+    "pressure_kpa": [0.0, 0.0],
+    "pressure_stiffening_per_kpa": 0.15,
+    "pressure_strain_per_kpa": 0.0005,
+    "radial_distortion_k1": 0.12,
+    "sensor_radius_mm": 15.0,
+    "top_layer_motion_scale": 1.0
+  },
+  "schema_version": 1,
+  "source_domain": "synthetic",
+  "units": {
+    "angle": "degree",
+    "force": "N",
+    "intensity": "normalized_0_1",
+    "length": "mm",
+    "pressure": "kPa",
+    "spatial_frequency": "cycles/mm"
+  }
+}
