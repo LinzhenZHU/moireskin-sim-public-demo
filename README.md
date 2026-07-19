@@ -1,6 +1,6 @@
 # MoiréSkin R1 Simulation Public Demo
 
-[Open the hosted demo](https://moireskin-sim-public-demo.streamlit.app/)
+[Open the hosted demo](https://moireskinsimdemo.streamlit.app/)
 
 Read-only Streamlit proof of concept for five-pressure rigid-object contact
 simulation and local 2.5D reconstruction from Moiré deformation plus
