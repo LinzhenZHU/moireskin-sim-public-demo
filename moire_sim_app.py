@@ -62,9 +62,9 @@ OBJECT_LABELS = {
     "serrated_key": "锯齿钥匙（exploratory）",
 }
 PATTERN_LABELS = {
-    "parallel": "平行条纹",
-    "cross": "十字光栅",
-    "hexagonal": "六向 / 六边形光栅",
+    "parallel": "Parallel fringes",
+    "cross": "Cross grating",
+    "hexagonal": "Six-direction / hexagonal grating",
 }
 PATTERN_SHORT_LABELS = {
     "parallel": "平行",
@@ -240,7 +240,7 @@ def build_rigid_observation_figure(state, sensor_radius_mm):
             "Viridis",
             0,
             height_limit,
-            "高度 mm",
+            "height (mm)",
         ),
         (
             1,
@@ -249,7 +249,7 @@ def build_rigid_observation_figure(state, sensor_radius_mm):
             "Viridis",
             0,
             height_limit,
-            "高度 mm",
+            "height (mm)",
         ),
         (
             1,
@@ -262,7 +262,7 @@ def build_rigid_observation_figure(state, sensor_radius_mm):
             "Viridis",
             0,
             height_limit,
-            "高度 mm",
+            "height (mm)",
         ),
         (
             1,
@@ -275,12 +275,12 @@ def build_rigid_observation_figure(state, sensor_radius_mm):
             "Viridis",
             0,
             height_limit,
-            "高度 mm",
+            "height (mm)",
         ),
-        (2, 1, state["ground_truth_albedo_image"], "gray", 0, 255, "灰度"),
-        (2, 2, state["see_through_image"], "gray", 0, 255, "灰度"),
-        (2, 3, state["recovered_appearance_image"], "gray", 0, 255, "灰度"),
-        (2, 4, detail, "RdBu_r", -detail_limit, detail_limit, "高度 mm"),
+        (2, 1, state["ground_truth_albedo_image"], "gray", 0, 255, "intensity"),
+        (2, 2, state["see_through_image"], "gray", 0, 255, "intensity"),
+        (2, 3, state["recovered_appearance_image"], "gray", 0, 255, "intensity"),
+        (2, 4, detail, "RdBu_r", -detail_limit, detail_limit, "height (mm)"),
     )
     for row, column, image, colorscale, zmin, zmax, label in panels:
         panel_axis = (
@@ -376,28 +376,28 @@ def build_rigid_moire_figure(state, sensor_radius_mm):
             "gray",
             0.5,
             1.5,
-            "包络",
+            "envelope",
         ),
         (
             state["deformed_moire_envelope"],
             "gray",
             0.5,
             1.5,
-            "包络",
+            "envelope",
         ),
         (
             envelope_difference,
             "RdBu_r",
             -envelope_limit,
             envelope_limit,
-            "包络差分",
+            "envelope difference",
         ),
         (
             raw_difference,
             "RdBu_r",
             -raw_limit,
             raw_limit,
-            "灰度差分",
+            "intensity difference",
         ),
     )
     for column, (image, colorscale, zmin, zmax, label) in enumerate(
@@ -689,10 +689,10 @@ def build_public_r1_comparison_figure(state, output):
         horizontal_spacing=0.035,
     )
     panels = (
-        (truth, "Viridis", 0.0, height_limit, "高度 mm"),
-        (physics, "Viridis", 0.0, height_limit, "高度 mm"),
-        (prediction, "Viridis", 0.0, height_limit, "高度 mm"),
-        (error, "Magma", 0.0, error_limit, "|误差| mm"),
+        (truth, "Viridis", 0.0, height_limit, "height (mm)"),
+        (physics, "Viridis", 0.0, height_limit, "height (mm)"),
+        (prediction, "Viridis", 0.0, height_limit, "height (mm)"),
+        (error, "Magma", 0.0, error_limit, "|error| (mm)"),
     )
     for column, (image, colorscale, zmin, zmax, label) in enumerate(
         panels,
@@ -872,7 +872,7 @@ def build_public_r1_evidence_figure(state, output):
         horizontal_spacing=0.03,
     )
     panels = (
-        (output["mask_probability"], "Viridis", 0.0, 1.0, "概率"),
+        (output["mask_probability"], "Viridis", 0.0, 1.0, "probability"),
         (
             output["uncertainty_mm"],
             "Magma",
@@ -1096,109 +1096,110 @@ def render_public_r1_demo(config):
     with st.sidebar:
         st.header("MoiréSkin · Frozen R1")
         st.caption(
-            "五压力膜接触 + Moiré/see-through 多模态重建。"
-            "固定 192² 物理网格与 2× 相机采样，CPU ONNX 推理。"
+            "Five-pressure membrane contact with multimodal Moiré/see-through "
+            "reconstruction. Fixed 192² physics grid, 2× camera sampling, "
+            "and CPU ONNX inference."
         )
         with st.form("public-r1-controls"):
             object_name = st.selectbox(
-                "接触物体",
+                "Contact object",
                 PUBLIC_OBJECTS,
                 index=PUBLIC_OBJECTS.index("coin_relief"),
                 format_func=public_object_label,
             )
             pattern = st.selectbox(
-                "光栅 pattern",
+                "Grating pattern",
                 tuple(PATTERN_LABELS),
                 index=tuple(PATTERN_LABELS).index("cross"),
                 format_func=PATTERN_LABELS.get,
             )
             pressure_frame_count = st.select_slider(
-                "用于重建的压力帧数",
+                "Pressure frames used for reconstruction",
                 options=(1, 2, 3, 5),
                 value=5,
             )
             indentation = st.slider(
-                "压入深度 (mm)",
+                "Indentation depth (mm)",
                 0.52,
                 1.18,
                 0.85,
                 0.03,
             )
             rotation = st.slider(
-                "平面旋转 (deg)",
+                "In-plane rotation (deg)",
                 -90.0,
                 90.0,
                 20.0,
                 5.0,
             )
             offset_x = st.slider(
-                "物体位置 x (mm)",
+                "Object position x (mm)",
                 -2.0,
                 2.0,
                 0.0,
                 0.25,
             )
             offset_y = st.slider(
-                "物体位置 y (mm)",
+                "Object position y (mm)",
                 -2.0,
                 2.0,
                 0.0,
                 0.25,
             )
-            with st.expander("表面与成像", expanded=True):
+            with st.expander("Surface and imaging", expanded=True):
                 texture_frequency = st.slider(
-                    "几何纹理频率 (cycles/mm)",
+                    "Geometric texture frequency (cycles/mm)",
                     0.20,
                     2.60,
                     1.20,
                     0.05,
                 )
                 visual_texture_frequency = st.slider(
-                    "视觉纹理频率 (cycles/mm)",
+                    "Visual texture frequency (cycles/mm)",
                     0.20,
                     2.60,
                     0.70,
                     0.05,
                 )
                 relief_scale = st.slider(
-                    "表面起伏尺度",
+                    "Surface relief scale",
                     0.72,
                     1.28,
                     1.00,
                     0.04,
                 )
                 camera_psf_sigma = st.slider(
-                    "相机 PSF σ (px)",
+                    "Camera PSF σ (px)",
                     0.20,
                     0.72,
                     0.45,
                     0.01,
                 )
                 grating_open_fraction = st.slider(
-                    "单方向光栅开口率",
+                    "Single-direction grating open fraction",
                     0.73,
                     0.90,
                     0.82,
                     0.01,
                 )
                 grating_line_transmittance = st.slider(
-                    "光栅线透射率",
+                    "Grating-line transmittance",
                     0.05,
                     0.16,
                     0.10,
                     0.01,
                 )
                 noise_std = st.slider(
-                    "读出噪声 σ",
+                    "Readout noise σ",
                     0.0015,
                     0.0120,
                     0.0040,
                     0.0005,
                     format="%.4f",
                 )
-            with st.expander("膜与复现"):
+            with st.expander("Membrane and reproducibility"):
                 base_tension = st.slider(
-                    "0 kPa 膜张力 (N/mm)",
+                    "0 kPa membrane tension (N/mm)",
                     0.064,
                     0.096,
                     0.080,
@@ -1207,20 +1208,20 @@ def render_public_r1_demo(config):
                 )
                 seed = int(
                     st.number_input(
-                        "随机种子",
+                        "Random seed",
                         min_value=0,
                         value=7,
                         step=1,
                     )
                 )
             st.form_submit_button(
-                "运行五压力模拟 + R1",
+                "Run five-pressure simulation + R1",
                 type="primary",
                 use_container_width=True,
             )
         st.caption(
-            "公开 Demo 不生成训练集、不训练模型、不接受文件路径，"
-            "且不包含 sealed-test 样本。"
+            "This public demo does not generate training data, train models, "
+            "accept file paths, or contain sealed-test samples."
         )
 
     parameters = {
@@ -1253,7 +1254,7 @@ def render_public_r1_demo(config):
         )
     )
     with st.spinner(
-        "正在生成 0/2/4/6/8 kPa 观测并运行冻结 R1…"
+        "Generating 0/2/4/6/8 kPa observations and running Frozen R1…"
     ):
         states = _simulate_public_pressure_series_cached(
             config,
@@ -1288,10 +1289,10 @@ def render_public_r1_demo(config):
     )
     category = object_category(object_name)
     category_labels = {
-        "trained named family": "具名训练族",
-        "held-out named family": "具名 held-out 族",
-        "exploratory named family": "具名探索族",
-        "procedural OOD": "程序化 OOD",
+        "trained named family": "named training family",
+        "held-out named family": "named held-out family",
+        "exploratory named family": "named exploratory family",
+        "procedural OOD": "procedural OOD",
     }
 
     st.title("Moiré + See-through · Frozen R1 Reconstruction")
@@ -1303,24 +1304,25 @@ def render_public_r1_demo(config):
     )
     if category == "procedural OOD":
         st.info(
-            "这是训练集中不存在的确定性随机表面，用于压力测试泛化；"
-            "当前数值是该合成样本的在线诊断，不是 sealed-test 结果。"
+            "This deterministic random surface is absent from the training set "
+            "and stress-tests generalization. These values are live diagnostics "
+            "for this synthetic sample, not sealed-test results."
         )
 
     summary = st.columns(4)
     summary[0].metric(
-        "R1 高度 NRMSE",
+        "R1 Height NRMSE",
         f"{100.0 * metrics['height_nrmse']:.1f}%",
         f"{height_delta_pp:+.1f} pp vs physics",
         delta_color="inverse",
     )
     summary[1].metric(
-        "R1 纹理相关 r",
+        "R1 Texture Correlation r",
         f"{metrics['texture_correlation']:.3f}",
         f"{texture_delta:+.3f} vs physics",
     )
     summary[2].metric(
-        "R1 轮廓 IoU",
+        "R1 Contact IoU",
         f"{metrics['mask_iou']:.3f}",
         (
             "≈0.000 vs physics"
@@ -1330,25 +1332,26 @@ def render_public_r1_demo(config):
         delta_color="off" if abs(iou_delta) < 0.0005 else "normal",
     )
     summary[3].metric(
-        "R1 法向误差",
+        "R1 Normal Error",
         f"{metrics['normal_error_deg']:.1f}°",
         f"{normal_delta:+.1f}° vs physics",
         delta_color="inverse",
     )
     st.caption(
-        f"预测不确定度 p95 {metrics['uncertainty_p95_mm']:.3f} mm · "
-        "高度 NRMSE 与纹理相关均按冻结 evaluator 的 GT 接触支撑口径计算；"
-        "线上合成 GT 仅用于交互诊断。"
+        f"Prediction uncertainty p95 {metrics['uncertainty_p95_mm']:.3f} mm · "
+        "Height NRMSE and texture correlation use the Frozen evaluator's GT "
+        "contact support. Online synthetic GT is shown only for interactive "
+        "diagnostics."
     )
 
-    st.subheader("同一合成接触上的公平对比")
+    st.subheader("Fair Comparison on the Same Synthetic Contact")
     st.plotly_chart(
         build_public_r1_comparison_figure(anchor, output),
         use_container_width=True,
         config={"displaylogo": False},
     )
     st.markdown(
-        "| 系统 | 高度 NRMSE ↓ | 纹理 r ↑ | IoU ↑ | 法向误差 ↓ |\n"
+        "| System | Height NRMSE ↓ | Texture r ↑ | IoU ↑ | Normal error ↓ |\n"
         "|---|---:|---:|---:|---:|\n"
         f"| Pure physics | {100 * physics_metrics['height_nrmse']:.1f}% | "
         f"{physics_metrics['texture_correlation']:.3f} | "
@@ -1364,7 +1367,7 @@ def render_public_r1_demo(config):
         f"**{metrics['normal_error_deg']:.1f}°** |"
     )
 
-    st.subheader("渐进气压观测")
+    st.subheader("Progressive Pressure Observations")
     selected_columns = st.columns(
         len(output["selected_pressure_indices"])
     )
@@ -1380,11 +1383,12 @@ def render_public_r1_demo(config):
             clamp=True,
         )
     st.caption(
-        "显示层已统一 y 轴方向；模型仍接收原始仿真数组。"
-        "1/2/3 帧模式只改变 pressure-validity，不重新选择或调节模型。"
+        "The display uses a consistent y-axis orientation; the model still "
+        "receives the original simulation arrays. The 1/2/3-frame modes only "
+        "change pressure validity; they do not select or tune a different model."
     )
 
-    st.subheader("4 kPa 锚点的形变 Moiré")
+    st.subheader("Deformed Moiré at the 4 kPa Anchor")
     st.plotly_chart(
         build_rigid_moire_figure(
             anchor,
@@ -1393,7 +1397,7 @@ def render_public_r1_demo(config):
         use_container_width=True,
         config={"displaylogo": False},
     )
-    with st.expander("查看 Moiré / see-through / appearance 全链路"):
+    with st.expander("View the Full Moiré / See-through / Appearance Pipeline"):
         st.plotly_chart(
             build_rigid_observation_figure(
                 anchor,
@@ -1403,27 +1407,29 @@ def render_public_r1_demo(config):
             config={"displaylogo": False},
         )
 
-    st.subheader("局部 2.5D 表面与外观")
+    st.subheader("Local 2.5D Surface and Appearance")
     st.plotly_chart(
         build_public_r1_surface_figure(anchor, output),
         use_container_width=True,
         config={"displaylogo": False, "scrollZoom": True},
     )
     st.caption(
-        "Recovered appearance 只作为 R1 表面的颜色贴图；"
-        "图案不会被无条件写成高度。几何由多压力 raw image、"
-        "纯物理初值和 confidence-gated residual 共同决定。"
+        "Recovered appearance is used only as a color map on the R1 surface; "
+        "visual patterns are not unconditionally converted into height. Geometry "
+        "is determined jointly by multi-pressure raw images, the pure-physics "
+        "initial estimate, and a confidence-gated residual."
     )
 
-    st.subheader("Fusion 与不确定性")
+    st.subheader("Fusion and Uncertainty")
     st.plotly_chart(
         build_public_r1_evidence_figure(anchor, output),
         use_container_width=True,
         config={"displaylogo": False},
     )
     st.caption(
-        "Physics / appearance / safety gate 是冻结模型的真实输出，"
-        "用于观察物理低频、外观高频和安全回退在空间上的分工。"
+        "The physics, appearance, and safety gates are actual Frozen R1 outputs. "
+        "They show how low-frequency physics, high-frequency appearance, and "
+        "safe fallback divide responsibility across the surface."
     )
 
     source = metadata["source"]
